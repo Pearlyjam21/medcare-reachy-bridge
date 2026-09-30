@@ -1,19 +1,34 @@
 <!doctype html>
-<html>
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width" />
-		<title>My static Space</title>
-		<link rel="stylesheet" href="style.css" />
-	</head>
-	<body>
-		<div class="card">
-			<h1>Welcome to your static Space!</h1>
-			<p>You can modify this app directly by editing <i>index.html</i> in the Files and versions tab.</p>
-			<p>
-				Also don't forget to check the
-				<a href="https://huggingface.co/docs/hub/spaces" target="_blank">Spaces documentation</a>.
-			</p>
-		</div>
-	</body>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MedCare Reachy</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>💊 MedCare Reachy</h1>
+    <p class="lede">A Reachy Mini app that reminds at medication time, finds the patient, prompts each medicine, and
+      streams intake landmarks to a MedAiCarePlus home server, which decides what is recorded.</p>
+
+    <section>
+      <h2>Setup</h2>
+      <ol>
+        <li>In the MedAiCarePlus web app: <strong>Settings → Reachy robot → Pair</strong>, and copy the robot key.</li>
+        <li>On the server, set <code>DEVICE_BIND</code> to its home-network IP so the robot can reach port 8001.</li>
+        <li>Install <strong>MedCare Reachy</strong> from the robot's dashboard, open its settings page, and enter the server address and robot key.</li>
+      </ol>
+    </section>
+
+    <section class="warn">
+      <h2>Limits</h2>
+      <ul>
+        <li>Needs a MedAiCarePlus server on your home network.</li>
+        <li>Cannot identify which pill was taken or how many; unverified doses go to a family member to confirm.</li>
+        <li>Not a medical device. Prototype; not yet tested on a real robot's camera. No microphone.</li>
+      </ul>
+    </section>
+  </main>
+</body>
 </html>

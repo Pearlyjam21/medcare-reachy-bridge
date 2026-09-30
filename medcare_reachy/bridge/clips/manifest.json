@@ -1,0 +1,70 @@
+{
+  "version": 1,
+  "note": "Prerecorded prompts. WAV files live at <CLIPS_DIR>/<language>/<clip_id>.wav (mono, 16-bit). Optional per-medication prompts may be added as med_<med_id>.wav; without one, med_prompt_generic is played. No clip may mention other doses or the rest of the day. All text must pass clinician review before release.",
+  "clips": {
+    "wake_greeting": {
+      "zh-TW": "您好！吃藥的時間到了。",
+      "en": "Hello! It's time for your medicine.",
+      "review_status": "pending_clinician_review"
+    },
+    "reminder": {
+      "zh-TW": "提醒您，現在是吃藥的時間。",
+      "en": "A gentle reminder: it's time for your medicine.",
+      "review_status": "pending_clinician_review"
+    },
+    "searching": {
+      "zh-TW": "我正在找您，請到我面前來。",
+      "en": "I'm looking for you. Please come in front of me.",
+      "review_status": "pending_clinician_review"
+    },
+    "waiting_for_patient": {
+      "zh-TW": "我在等要吃藥的人，請他到我面前來。",
+      "en": "I'm waiting for the person whose medicine this is. Please ask them to come to me.",
+      "review_status": "pending_clinician_review"
+    },
+    "waiting_for_tablet": {
+      "zh-TW": "我會等您在平板上完成。",
+      "en": "I'll wait until you finish on the tablet.",
+      "review_status": "pending_clinician_review"
+    },
+    "med_prompt_generic": {
+      "zh-TW": "請現在吃下一種藥。",
+      "en": "Please take your next medicine now.",
+      "review_status": "pending_clinician_review"
+    },
+    "already_taken": {
+      "zh-TW": "這次的藥您已經吃過了，做得很好！",
+      "en": "You've already taken these medicines. Well done!",
+      "review_status": "pending_clinician_review"
+    },
+    "confirm_with_caregiver": {
+      "zh-TW": "謝謝您。我會請家人確認這種藥。",
+      "en": "Thank you. I'll ask your family to confirm this medicine.",
+      "review_status": "pending_clinician_review"
+    },
+    "help": {
+      "zh-TW": "需要幫忙嗎？準備好的時候，請在我面前吃藥。",
+      "en": "Do you need help? When you're ready, please take your medicine in front of me.",
+      "review_status": "pending_clinician_review"
+    },
+    "wind_down": {
+      "zh-TW": "這次就到這裡，請多保重！",
+      "en": "That's all for now. Take care!",
+      "review_status": "pending_clinician_review"
+    },
+    "thanks": {
+      "zh-TW": "謝謝您！",
+      "en": "Thank you!",
+      "review_status": "pending_clinician_review"
+    }
+  },
+  "per_medication": {
+    "file_pattern": "med_<med_id>.wav",
+    "fallback": "med_prompt_generic",
+    "template": {
+      "zh-TW": "請現在吃一顆{med_name}。",
+      "en": "Please take one {med_name} now."
+    },
+    "review_status": "pending_clinician_review"
+  }
+}

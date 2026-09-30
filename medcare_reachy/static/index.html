@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MedCare Reachy</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <h1>MedCare Reachy</h1>
+    <p class="lede">Connect this robot to your MedAiCarePlus server. Pair the robot in the web app first:
+      <em>Settings → Reachy robot → Pair</em>, then copy the robot key here.</p>
+
+    <section aria-labelledby="status-title">
+      <h2 id="status-title">Status</h2>
+      <p id="state" class="state" role="status">Loading…</p>
+      <p id="detail" class="muted"></p>
+      <dl id="metrics"></dl>
+      <button type="button" id="restart" class="secondary">Restart</button>
+    </section>
+
+    <section aria-labelledby="config-title">
+      <h2 id="config-title">Connection</h2>
+      <form id="config">
+        <label>Server address
+          <input name="app_url" type="url" placeholder="http://192.168.1.20:8001" autocomplete="off" required>
+          <small>Your MedAiCarePlus server's device port on the home network. Never an internet address.</small>
+        </label>
+        <label>Robot key
+          <input name="device_token" type="password" placeholder="rdv1.…" autocomplete="off">
+          <small id="token-hint">Shown once when you pair the robot. Leave empty to keep the current key.</small>
+        </label>
+        <label>Language
+          <select name="language">
+            <option value="zh-TW">繁體中文</option>
+            <option value="en">English</option>
+          </select>
+        </label>
+        <label>Camera rate (frames per second)
+          <input name="capture_fps" type="number" min="1" max="15" step="1" value="10">
+          <small>The robot's camera feed tops out near 10 fps; below 12 fps the server sends every dose to a family member to confirm.</small>
+        </label>
+        <button type="submit">Save and connect</button>
+        <p id="form-error" class="error" role="alert"></p>
+      </form>
+    </section>
+  </main>
+  <script src="/static/main.js"></script>
+</body>
+</html>
