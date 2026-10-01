@@ -44,6 +44,12 @@ against a pinned SHA-256.
 
 ## Status
 
+> **0.1.1 — vision is temporarily off on Reachy Mini Wireless.** The robot's Raspberry Pi 4 CPU has no AES
+> instructions, and MediaPipe's ARM64 builds need them (0.1.0 crashed on start with `SIGILL … compiled with aes
+> enabled`). 0.1.1 no longer installs MediaPipe on the robot and shows the reason on its settings page instead of
+> crashing. Camera intake detection will move to the MedAiCarePlus server in the next version. LINE reminders are
+> unaffected.
+
 - Runs end to end against the Reachy Mini simulator (`reachy-mini-daemon --mockup-sim`): it picks up a reminder,
   wakes, and searches for the patient. The simulator has no camera, so the vision path and frame rate still need a
   real robot.

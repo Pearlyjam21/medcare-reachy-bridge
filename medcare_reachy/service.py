@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from medcare_reachy import models
+from medcare_reachy import models, platform_check
 from medcare_reachy.settings_store import SettingsStore
 
 log = logging.getLogger("medcare_reachy")
@@ -26,13 +26,27 @@ STEP_TEXT = {
 }
 
 
+class VisionUnavailable(RuntimeError):
+    pass
+
+
+def _import_vision():
+    # Loading MediaPipe on an unsupported CPU kills the process with SIGILL, so it's imported only after
+    # platform_check has said yes.
+    from medcare_reachy.bridge.vision import VisionEngine
+    return VisionEngine
+
+
 async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runner) -> None:
-    # Imports are deferred so the settings page works even if mediapipe is still installing or broken.
+    supported, reason = platform_check.vision_supported()
+    if not supported:
+        raise VisionUnavailable(reason)
+    VisionEngine = _import_vision()
+    # Deferred so the settings page works even if a dependency is still installing or broken.
     from medcare_reachy.bridge.app_client import AppClient
     from medcare_reachy.bridge.clips import ClipPlayer
     from medcare_reachy.bridge.media import ReachyRobot
     from medcare_reachy.bridge.runner import MonitorStream, Runner
-    from medcare_reachy.bridge.vision import VisionEngine
 
     await asyncio.to_thread(models.ensure_models, models_dir)
     engine = VisionEngine(models_dir)
@@ -113,6 +127,10 @@ class BridgeService:
             loop.run_until_complete(self.bridge(self.reachy_mini, settings, self.models_dir, self._on_runner))
             with self._lock:
                 self._set("stopped", "")
+        except VisionUnavailable as exc:   # expected on Raspberry Pi 4 robots: explain, don't crash
+            log.warning("vision unavailable: %s", exc)
+            with self._lock:
+                self._set("error", str(exc))
         except Exception as exc:   # surfaced on the settings page; the app itself keeps running
             log.exception("bridge stopped with an error")
             with self._lock:

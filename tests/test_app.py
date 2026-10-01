@@ -193,3 +193,42 @@ def test_status_describes_the_current_step_during_a_task(tmp_path):
     assert wait_for(lambda: service.status().get("slot_state") == "SEARCHING")
     assert "Looking for the patient" in service.status()["detail"]
     service.stop()
+
+
+# ── robot CPU without AES (Raspberry Pi 4): MediaPipe 1.x SIGILLs, which can't be caught ──
+PI4_CPUINFO = "processor : 0\nFeatures\t: fp asimd evtstrm crc32 cpuid\nCPU part\t: 0xd08\n"
+X86_CPUINFO = "processor : 0\nflags\t\t: fpu sse2 aes avx2\n"
+
+
+def test_vision_is_refused_on_arm_without_aes(monkeypatch):
+    from medcare_reachy import platform_check
+    ok, reason = platform_check.vision_supported(machine="aarch64", cpuinfo=PI4_CPUINFO, mediapipe_present=True)
+    assert not ok and "AES" in reason
+
+
+def test_vision_is_allowed_on_x86_and_arm_with_aes():
+    from medcare_reachy import platform_check
+    assert platform_check.vision_supported(machine="x86_64", cpuinfo=X86_CPUINFO, mediapipe_present=True)[0]
+    arm_aes = PI4_CPUINFO.replace("crc32", "aes pmull sha1 sha2 crc32")
+    assert platform_check.vision_supported(machine="aarch64", cpuinfo=arm_aes, mediapipe_present=True)[0]
+
+
+def test_missing_mediapipe_is_reported():
+    from medcare_reachy import platform_check
+    ok, reason = platform_check.vision_supported(machine="x86_64", cpuinfo=X86_CPUINFO, mediapipe_present=False)
+    assert not ok and "MediaPipe" in reason
+
+
+def test_unsupported_platform_stops_the_bridge_with_a_clear_status_instead_of_crashing(tmp_path, monkeypatch):
+    import medcare_reachy.service as service_module
+    store = SettingsStore(tmp_path / "s.json")
+    store.save(GOOD)
+    monkeypatch.setattr(service_module.platform_check, "vision_supported",
+                        lambda: (False, "This robot's processor has no AES instructions."))
+    imported = []
+    monkeypatch.setattr(service_module, "_import_vision", lambda: imported.append(True))
+    service = BridgeService(object(), store)          # real default_bridge
+    service.start()
+    assert wait_for(lambda: service.status()["state"] == "error")
+    assert "AES" in service.status()["detail"]
+    assert imported == []                             # MediaPipe was never loaded
