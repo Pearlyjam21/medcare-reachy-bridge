@@ -1,12 +1,14 @@
 # Vision models: where they come from
 
-`medcare_reachy/vision_models/` holds six ONNX files, pinned by SHA-256 in `medcare_reachy/models.py`.
+`medcare_reachy/vision_models/` holds seven ONNX files (and the emotion model's metadata), pinned by SHA-256 in
+`medcare_reachy/models.py`.
 
 | File | Source |
 |---|---|
 | `face_detector.onnx`, `face_landmarks_detector.onnx` | `face_landmarker.task` (float16/1), the web app's browser model |
 | `hand_detector.onnx`, `hand_landmarks_detector.onnx` | `hand_landmarker.task` (float16/1) |
 | `pose_landmarks_detector.onnx` | `pose_landmarker_lite.task` (float16/1) |
+| `emotion_seed43.onnx` (+ `_metadata.json`) | the MedAiCarePlus server's `models/emotion_seed43/model_fp32.onnx`, unchanged (MobileNetV3-Large, 7 emotions, 112×112 grayscale input) |
 | `pose_detector.onnx` | OpenCV Zoo `person_detection_mediapipe_2023mar.onnx` (HF `opencv/person_detection_mediapipe`) |
 
 The `.task` files are zip archives of TFLite models, from

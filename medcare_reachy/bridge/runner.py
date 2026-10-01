@@ -12,7 +12,8 @@ from medcare_reachy.bridge.session import SlotSession
 log = logging.getLogger(__name__)
 
 CAPTURE_FPS = 15.0
-VISION_INTERVAL = 0.2          # JPEG uploads at most 5 fps, like the browser's 200 ms gate
+VISION_INTERVAL = 0.5          # identity-only snapshots, 2 fps (the server re-checks identity every 0.5 s)
+EMOTION_INTERVAL = 0.5         # emotion is scored on the robot, at most 2 fps, only for the verified face
 JPEG_QUALITY = 75
 FPS_WINDOW = 10.0
 HEARTBEAT_SECONDS = 10.0
@@ -42,8 +43,11 @@ class MonitorStream:
     """
 
     def __init__(self, app, robot, engine, *, clock=time.monotonic, run_blocking=asyncio.to_thread,
-                 encode=encode_jpeg, fps=CAPTURE_FPS, vision_interval=VISION_INTERVAL):
+                 encode=encode_jpeg, fps=CAPTURE_FPS, vision_interval=VISION_INTERVAL, emotion=None,
+                 emotion_interval=EMOTION_INTERVAL):
         self.app, self.robot, self.engine = app, robot, engine
+        self.emotion, self.emotion_interval = emotion, emotion_interval
+        self._last_emotion = float("-inf")
         self.clock, self.run_blocking, self.encode = clock, run_blocking, encode
         self.interval = 1.0 / fps
         self.vision_interval = vision_interval
@@ -112,12 +116,26 @@ class MonitorStream:
         packet = await self.run_blocking(self.engine.process, frame, seq, captured * 1000.0)
         if self.session is not session:
             return   # session changed while the landmark models ran: this frame is stale
+        packet = await self._with_emotion(frame, packet, captured)
         jpeg = None
         if not self._vision_busy and captured - self._last_vision >= self.vision_interval:
             self._last_vision = captured
             jpeg = await self.run_blocking(self.encode, frame)
         self._landmark_busy = True
         self._spawn(self._send_landmarks(session, {**session, **packet}, seq, jpeg))
+
+    async def _with_emotion(self, frame, packet: dict, captured: float) -> dict:
+        """Attach the robot-scored emotion of the server-verified face (the server re-checks it)."""
+        target = (self.latest or {}).get("target_box")
+        if self.emotion is None or not target or captured - self._last_emotion < self.emotion_interval:
+            return packet
+        self._last_emotion = captured
+        try:
+            report = await self.run_blocking(self.emotion.score, frame, packet, target)
+        except Exception:   # emotion is optional; never lose the landmark frame over it
+            log.exception("emotion scoring failed")
+            return packet
+        return packet if report is None else {**packet, "emotion": report}
 
     async def drain(self) -> None:
         while self._tasks:

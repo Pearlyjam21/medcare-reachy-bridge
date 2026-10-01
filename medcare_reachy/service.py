@@ -32,17 +32,20 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
     from medcare_reachy.bridge.clips import ClipPlayer
     from medcare_reachy.bridge.media import ReachyRobot
     from medcare_reachy.bridge.runner import MonitorStream, Runner
+    from medcare_reachy.bridge.emotion import EmotionEngine
     from medcare_reachy.bridge.vision import VisionEngine   # ONNX Runtime; no MediaPipe, no AES needed
 
     await asyncio.to_thread(models.verify_models, models_dir)
     engine = await asyncio.to_thread(VisionEngine, models_dir)
+    emotion = await asyncio.to_thread(EmotionEngine, models_dir / models.EMOTION_MODEL)
     robot = ReachyRobot.attach(reachy_mini)
     clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
     clips.audit()
     try:
         async with AppClient(settings["app_url"], settings["device_token"]) as app:
             runner = Runner(app=app, robot=robot, clips=clips,
-                            stream=MonitorStream(app, robot, engine, fps=float(settings["capture_fps"])))
+                            stream=MonitorStream(app, robot, engine, fps=float(settings["capture_fps"]),
+                                                 emotion=emotion))
             on_runner(runner)
             await runner.run()
     finally:

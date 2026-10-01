@@ -42,6 +42,7 @@ class StreamApp:
         self.gate = None
         self.fail_landmarks = None
         self.unreachable_since = None
+        self.target_box = None   # set once the fake server "verifies" the patient
 
     async def monitor_landmarks(self, packet):
         self.landmarks.append(packet)
@@ -49,7 +50,8 @@ class StreamApp:
             await self.gate.wait()
         if self.fail_landmarks:
             raise self.fail_landmarks
-        return {"session_id": packet["session_id"], "frame_seq": packet["frame_seq"], "identity_status": "verified"}
+        return {"session_id": packet["session_id"], "frame_seq": packet["frame_seq"], "identity_status": "verified",
+                "target_box": self.target_box}
 
     async def monitor_vision(self, session_id, generation, frame_seq, jpeg):
         self.vision.append((session_id, generation, frame_seq, jpeg))
@@ -111,18 +113,18 @@ def test_one_landmark_request_in_flight_and_stale_frames_dropped():
     assert [p["frame_seq"] for p in app.landmarks] == [1, 2]
 
 
-def test_vision_at_most_5_fps_and_after_its_landmark_packet():
+def test_vision_at_most_2_fps_and_after_its_landmark_packet():
     stream, app, camera, clock = make_stream()
 
     async def scenario():
         stream.attach({"session_id": "s1", "generation": "g1"})
-        for _ in range(8):
+        for _ in range(16):
             await stream.step()
             await stream.drain()
             clock.t += 0.07
 
     asyncio.run(scenario())
-    assert [seq for _, _, seq, _ in app.vision] == [1, 4, 7]
+    assert [seq for _, _, seq, _ in app.vision] == [1, 9]
     assert app.vision[0] == ("s1", "g1", 1, b"jpg")
 
 
@@ -188,7 +190,7 @@ def test_fps_counters_use_a_10_second_window():
 
     asyncio.run(scenario())
     assert 14.5 <= stream.landmark_fps() <= 15.0
-    assert 4.5 <= stream.vision_fps() <= 5.0
+    assert 1.8 <= stream.vision_fps() <= 2.0
     clock.t += 11
     assert stream.landmark_fps() == 0
 
@@ -325,3 +327,58 @@ def test_after_failing_closed_on_app_loss_the_held_task_is_resumed_via_tasks_cur
     runner._pause = no_pause
     asyncio.run(runner._task_loop())
     assert app.calls == ["tasks_current", "slot", "tasks_current", "tasks_current", "slot", "tasks_next"]
+
+
+# ── emotion scored on the robot ──
+class FakeEmotion:
+    def __init__(self, report=None):
+        self.calls = []
+        self.report = report if report is not None else {"face_index": 0, "probabilities": {"sad": 1.0}}
+
+    def score(self, frame, packet, target_box):
+        self.calls.append(target_box)
+        return self.report
+
+
+def test_emotion_rides_on_the_landmark_packet_only_once_the_server_names_the_face():
+    clock, app, camera = Clock(), StreamApp(), Camera()
+    emotion = FakeEmotion()
+    stream = MonitorStream(app, camera, Engine(), clock=clock, run_blocking=inline, encode=lambda frame: b"jpg",
+                           emotion=emotion)
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        await stream.step()
+        await stream.drain()
+        assert "emotion" not in app.landmarks[0] and emotion.calls == []    # no verified face yet
+        app.target_box = [0.1, 0.1, 0.4, 0.4]
+        stream.latest = {**stream.latest, "target_box": app.target_box}
+        for _ in range(12):
+            clock.t += 1 / 15
+            await stream.step()
+            await stream.drain()
+
+    asyncio.run(scenario())
+    with_emotion = [p["frame_seq"] for p in app.landmarks if "emotion" in p]
+    assert len(with_emotion) == 2 and with_emotion[0] == 2 and with_emotion[1] - 2 >= 8   # at most every 0.5 s
+    assert app.landmarks[1]["emotion"] == {"face_index": 0, "probabilities": {"sad": 1.0}}
+    assert emotion.calls == [[0.1, 0.1, 0.4, 0.4]] * 2
+
+
+def test_emotion_failure_never_drops_the_landmark_frame():
+    clock, app, camera = Clock(), StreamApp(), Camera()
+
+    class Broken:
+        def score(self, *args):
+            raise RuntimeError("model crashed")
+
+    stream = MonitorStream(app, camera, Engine(), clock=clock, run_blocking=inline, encode=lambda frame: b"jpg",
+                           emotion=Broken())
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1", "target_box": [0.1, 0.1, 0.4, 0.4]})
+        await stream.step()
+        await stream.drain()
+
+    asyncio.run(scenario())
+    assert len(app.landmarks) == 1 and "emotion" not in app.landmarks[0]

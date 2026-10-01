@@ -1,0 +1,38 @@
+{
+  "format_version": 1,
+  "model_file": "emotion_seed43.onnx",
+  "model_name": "mobilenet_v3_large",
+  "labels": [
+    "angry",
+    "disgust",
+    "fear",
+    "happy",
+    "sad",
+    "surprise",
+    "neutral"
+  ],
+  "input_size": 112,
+  "preprocess_version": "ferplus-gray-rgb-imagenet-v1",
+  "preprocess": {
+    "version": "ferplus-gray-rgb-imagenet-v1",
+    "input_size": [
+      112,
+      112
+    ],
+    "channels": 3,
+    "source_mode": "grayscale replicated to RGB",
+    "mean": [
+      0.485,
+      0.456,
+      0.406
+    ],
+    "std": [
+      0.229,
+      0.224,
+      0.225
+    ],
+    "resize": "stretch to square",
+    "train_augmentation": "horizontal flip, affine +/-8deg, mild translation/scale, brightness/contrast"
+  },
+  "parameter_count": 4210999
+}

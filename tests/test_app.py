@@ -53,7 +53,17 @@ def test_public_view_never_contains_the_key():
 # ── models ──
 def test_bundled_models_match_their_pinned_hashes():
     assert models.verify_models() == models.DEFAULT_DIR
-    assert sorted(models.MODELS) == sorted(__import__("medcare_reachy.bridge.vision", fromlist=["x"]).MODEL_FILES)
+    landmark_models = __import__("medcare_reachy.bridge.vision", fromlist=["x"]).MODEL_FILES
+    assert set(landmark_models) | {"emotion_seed43.onnx", "emotion_seed43_metadata.json"} == set(models.MODELS)
+
+
+def test_bundled_emotion_model_loads_and_scores_seven_emotions():
+    import numpy as np
+    from medcare_reachy.bridge.emotion import LABELS, EmotionEngine
+
+    engine = EmotionEngine(models.DEFAULT_DIR / models.EMOTION_MODEL)
+    scores = engine.predict(np.full((480, 640, 3), 128, np.uint8), [0.3, 0.2, 0.3, 0.4])
+    assert tuple(scores) == LABELS and abs(sum(scores.values()) - 1) < 1e-6
 
 
 def test_missing_or_altered_model_is_refused(tmp_path):

@@ -1,9 +1,10 @@
-"""The six vision models, shipped inside this app and checked by SHA-256 before use.
+"""The vision models, shipped inside this app and checked by SHA-256 before use.
 
-They are the browser worker's MediaPipe Tasks models (face_landmarker, hand_landmarker, pose_landmarker_lite;
-Apache-2.0) converted to ONNX, plus OpenCV Zoo's ONNX export of the same MediaPipe pose detector (its TFLite
-original uses sparse weights the converter can't read). tools/MODELS.md records how they were made. Nothing is
-downloaded at run time; a damaged or altered install stops with a clear message.
+Six landmark models: the browser worker's MediaPipe Tasks models (face_landmarker, hand_landmarker,
+pose_landmarker_lite; Apache-2.0) converted to ONNX, plus OpenCV Zoo's ONNX export of the same MediaPipe pose
+detector (its TFLite original uses sparse weights the converter can't read). And the MedAiCarePlus server's seed-43
+emotion model, so emotion is scored on the robot. tools/MODELS.md records how they were made. Nothing is downloaded
+at run time; a damaged or altered install stops with a clear message.
 """
 
 import hashlib
@@ -17,7 +18,10 @@ MODELS = {
     "hand_landmarks_detector.onnx": "5ed334609f59b97a43eed7d993ce305bb49134dc4c8918ecb7471099fc51071a",
     "pose_detector.onnx": "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f",
     "pose_landmarks_detector.onnx": "cd7c2b67e1275239b80b17eab9cd861422ef6ac291370baf512c3022409a248d",
+    "emotion_seed43.onnx": "0caaedf04b60d1c95d89ee2162c8bf207ccd669b88865f155b17987cc15ffbad",
+    "emotion_seed43_metadata.json": "a5eb931d1cbb9ed862642bf73713954d318791bd0982020eeb04c051f96be739",
 }
+EMOTION_MODEL = "emotion_seed43.onnx"
 
 
 class ModelError(RuntimeError):
