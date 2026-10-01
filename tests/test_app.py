@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import time
+from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
@@ -50,33 +51,33 @@ def test_public_view_never_contains_the_key():
 
 
 # ── models ──
-def test_models_are_downloaded_once_and_verified(tmp_path, monkeypatch):
-    payload = {name: name.encode() * 10 for name in models.MODELS}
-    monkeypatch.setattr(models, "MODELS", {n: (f"https://x/{n}", hashlib.sha256(b).hexdigest()) for n, b in payload.items()})
-    calls = []
-
-    def download(url, destination):
-        calls.append(url)
-        destination.write_bytes(payload[url.rsplit("/", 1)[1]])
-
-    models.ensure_models(tmp_path, download=download)
-    models.ensure_models(tmp_path, download=download)
-    assert len(calls) == 3   # second call finds valid files
+def test_bundled_models_match_their_pinned_hashes():
+    assert models.verify_models() == models.DEFAULT_DIR
+    assert sorted(models.MODELS) == sorted(__import__("medcare_reachy.bridge.vision", fromlist=["x"]).MODEL_FILES)
 
 
-def test_tampered_model_is_rejected_and_not_kept(tmp_path, monkeypatch):
-    monkeypatch.setattr(models, "MODELS", {"m.task": ("https://x/m.task", "0" * 64)})
-    with pytest.raises(models.ModelError):
-        models.ensure_models(tmp_path, download=lambda url, dest: dest.write_bytes(b"evil"))
-    assert not (tmp_path / "m.task").exists() and not (tmp_path / "m.part").exists()
+def test_missing_or_altered_model_is_refused(tmp_path):
+    expected = {"m.onnx": hashlib.sha256(b"model").hexdigest()}
+    with pytest.raises(models.ModelError, match="missing"):
+        models.verify_models(tmp_path, expected)
+    (tmp_path / "m.onnx").write_bytes(b"evil")
+    with pytest.raises(models.ModelError, match="integrity"):
+        models.verify_models(tmp_path, expected)
+    (tmp_path / "m.onnx").write_bytes(b"model")
+    assert models.verify_models(tmp_path, expected) == tmp_path
 
 
-def test_pinned_hashes_match_the_repo_models():
-    repo = __import__("pathlib").Path(r"D:\medcareai2_20260920\app\frontend_source\public\models")
-    if not repo.exists():
-        pytest.skip("needs the full app repository")
-    for name, (_, expected) in models.MODELS.items():
-        assert hashlib.sha256((repo / name).read_bytes()).hexdigest() == expected
+def test_nothing_imports_mediapipe_or_opencv():
+    """The robot's Raspberry Pi 4 can't load MediaPipe (SIGILL), and OpenCV isn't installed there."""
+    import re
+    package = Path(models.__file__).parent
+    for source in package.rglob("*.py"):
+        if "tests" in source.parts:
+            continue
+        text = source.read_text(encoding="utf-8")
+        assert not re.search(r"^\s*(import|from)\s+mediapipe\b", text, re.M), source
+        if source.name != "media.py":   # VideoFileRobot (hardware-free testing) is the only OpenCV user
+            assert not re.search(r"^\s*import cv2\b", text, re.M), source
 
 
 # ── service ──
@@ -134,7 +135,7 @@ def test_bridge_failure_is_reported_not_raised(tmp_path):
     store.save(GOOD)
 
     async def broken(*args):
-        raise models.ModelError("face_landmarker.task failed its integrity check")
+        raise models.ModelError("Vision model hand_detector.onnx failed its integrity check")
 
     service = BridgeService(object(), store, bridge=broken)
     service.start()
@@ -195,40 +196,11 @@ def test_status_describes_the_current_step_during_a_task(tmp_path):
     service.stop()
 
 
-# ── robot CPU without AES (Raspberry Pi 4): MediaPipe 1.x SIGILLs, which can't be caught ──
-PI4_CPUINFO = "processor : 0\nFeatures\t: fp asimd evtstrm crc32 cpuid\nCPU part\t: 0xd08\n"
-X86_CPUINFO = "processor : 0\nflags\t\t: fpu sse2 aes avx2\n"
-
-
-def test_vision_is_refused_on_arm_without_aes(monkeypatch):
-    from medcare_reachy import platform_check
-    ok, reason = platform_check.vision_supported(machine="aarch64", cpuinfo=PI4_CPUINFO, mediapipe_present=True)
-    assert not ok and "AES" in reason
-
-
-def test_vision_is_allowed_on_x86_and_arm_with_aes():
-    from medcare_reachy import platform_check
-    assert platform_check.vision_supported(machine="x86_64", cpuinfo=X86_CPUINFO, mediapipe_present=True)[0]
-    arm_aes = PI4_CPUINFO.replace("crc32", "aes pmull sha1 sha2 crc32")
-    assert platform_check.vision_supported(machine="aarch64", cpuinfo=arm_aes, mediapipe_present=True)[0]
-
-
-def test_missing_mediapipe_is_reported():
-    from medcare_reachy import platform_check
-    ok, reason = platform_check.vision_supported(machine="x86_64", cpuinfo=X86_CPUINFO, mediapipe_present=False)
-    assert not ok and "MediaPipe" in reason
-
-
-def test_unsupported_platform_stops_the_bridge_with_a_clear_status_instead_of_crashing(tmp_path, monkeypatch):
-    import medcare_reachy.service as service_module
+# ── the real default bridge ──
+def test_damaged_install_stops_with_a_clear_status_instead_of_crashing(tmp_path):
     store = SettingsStore(tmp_path / "s.json")
     store.save(GOOD)
-    monkeypatch.setattr(service_module.platform_check, "vision_supported",
-                        lambda: (False, "This robot's processor has no AES instructions."))
-    imported = []
-    monkeypatch.setattr(service_module, "_import_vision", lambda: imported.append(True))
-    service = BridgeService(object(), store)          # real default_bridge
+    service = BridgeService(object(), store, models_dir=tmp_path / "empty")   # real default_bridge
     service.start()
     assert wait_for(lambda: service.status()["state"] == "error")
-    assert "AES" in service.status()["detail"]
-    assert imported == []                             # MediaPipe was never loaded
+    assert "reinstall the app" in service.status()["detail"]

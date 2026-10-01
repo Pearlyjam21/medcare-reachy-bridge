@@ -33,7 +33,7 @@ def _pose(landmarks) -> dict:
 
 def build_packet(face_result, hand_result, pose_result, frame_seq: int, timestamp_ms: float,
                  width: int, height: int) -> dict:
-    """MediaPipe Tasks results -> landmark packet (without session_id/generation)."""
+    """Landmarker results (MediaPipe Tasks shape: .face_landmarks etc.) -> landmark packet (without session_id/generation)."""
     return {
         "frame_seq": frame_seq,
         "timestamp": timestamp_ms / 1000,

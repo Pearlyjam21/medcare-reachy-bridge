@@ -22,12 +22,15 @@ RESUMABLE = frozenset({"app_unreachable"})   # slot results that leave the task 
 
 
 def encode_jpeg(frame) -> bytes:
-    import cv2
+    """BGR frame -> JPEG bytes."""
+    import io
 
-    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-    if not ok:
-        raise ValueError("JPEG encoding failed")
-    return buffer.tobytes()
+    import numpy as np
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.fromarray(np.ascontiguousarray(frame[:, :, ::-1])).save(buffer, format="JPEG", quality=JPEG_QUALITY)
+    return buffer.getvalue()
 
 
 class MonitorStream:
@@ -108,7 +111,7 @@ class MonitorStream:
         seq = self.frame_seq
         packet = await self.run_blocking(self.engine.process, frame, seq, captured * 1000.0)
         if self.session is not session:
-            return   # session changed while MediaPipe ran: this frame is stale
+            return   # session changed while the landmark models ran: this frame is stale
         jpeg = None
         if not self._vision_busy and captured - self._last_vision >= self.vision_interval:
             self._last_vision = captured

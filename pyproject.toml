@@ -5,16 +5,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medcare_reachy"
-version = "0.1.1"
-description = "Medication-time companion for Reachy Mini: reminds, prompts each medicine and streams intake landmarks to a MedAiCarePlus server."
+version = "0.2.0"
+description = "Medication-time companion for Reachy Mini: reminds, prompts each medicine, and watches each dose on the robot itself, streaming intake landmarks to a MedAiCarePlus server."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "reachy-mini",
-    # Not on ARM64: MediaPipe 1.x ARM64 wheels need ARMv8 AES (the Wireless robot's Raspberry Pi 4 has none and
-    # crashes with SIGILL), and 0.10.x ARM64 wheels need numpy<2, which conflicts with reachy-mini. On-robot
-    # vision is refused with a clear status instead (platform_check.py); vision moves to the server next.
-    "mediapipe>=1.0.1; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+    # Vision runs the MediaPipe models on ONNX Runtime (already a reachy-mini dependency): the MediaPipe library
+    # itself can't load on the Wireless robot's Raspberry Pi 4 (its ARM64 builds need AES instructions -> SIGILL).
+    "onnxruntime",
+    "pillow>=10",
+    "numpy",
     "httpx>=0.27",
 ]
 keywords = ["reachy-mini-app"]
@@ -34,4 +35,4 @@ where = ["."]
 include = ["medcare_reachy*"]
 
 [tool.setuptools.package-data]
-medcare_reachy = ["**/*"] # Also include all non-.py files (settings page, clip manifest)
+medcare_reachy = ["**/*"] # Also include all non-.py files (settings page, clip manifest, vision models)

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-_REPO_MODELS = PACKAGE_DIR.parent / "frontend_source" / "public" / "models"
+_REPO_MODELS = PACKAGE_DIR / "models"   # the ONNX vision models (see vision.MODEL_FILES)
 
 LANGUAGES = ("zh-TW", "en")
 BACKENDS = ("reachy", "video")

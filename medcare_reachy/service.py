@@ -10,7 +10,7 @@ import threading
 import time
 from pathlib import Path
 
-from medcare_reachy import models, platform_check
+from medcare_reachy import models
 from medcare_reachy.settings_store import SettingsStore
 
 log = logging.getLogger("medcare_reachy")
@@ -26,30 +26,16 @@ STEP_TEXT = {
 }
 
 
-class VisionUnavailable(RuntimeError):
-    pass
-
-
-def _import_vision():
-    # Loading MediaPipe on an unsupported CPU kills the process with SIGILL, so it's imported only after
-    # platform_check has said yes.
-    from medcare_reachy.bridge.vision import VisionEngine
-    return VisionEngine
-
-
 async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runner) -> None:
-    supported, reason = platform_check.vision_supported()
-    if not supported:
-        raise VisionUnavailable(reason)
-    VisionEngine = _import_vision()
     # Deferred so the settings page works even if a dependency is still installing or broken.
     from medcare_reachy.bridge.app_client import AppClient
     from medcare_reachy.bridge.clips import ClipPlayer
     from medcare_reachy.bridge.media import ReachyRobot
     from medcare_reachy.bridge.runner import MonitorStream, Runner
+    from medcare_reachy.bridge.vision import VisionEngine   # ONNX Runtime; no MediaPipe, no AES needed
 
-    await asyncio.to_thread(models.ensure_models, models_dir)
-    engine = VisionEngine(models_dir)
+    await asyncio.to_thread(models.verify_models, models_dir)
+    engine = await asyncio.to_thread(VisionEngine, models_dir)
     robot = ReachyRobot.attach(reachy_mini)
     clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
     clips.audit()
@@ -96,7 +82,7 @@ class BridgeService:
             if not SettingsStore.configured(settings):
                 self._set("not_configured", "Enter the server address and robot key on this page.")
                 return
-            self._set("starting", "Downloading models and connecting to the server…")
+            self._set("starting", "Loading the vision models and connecting to the server…")
             self._thread = threading.Thread(target=self._thread_main, args=(settings,),
                                             name="medcare-bridge", daemon=True)
             self._thread.start()
@@ -127,8 +113,8 @@ class BridgeService:
             loop.run_until_complete(self.bridge(self.reachy_mini, settings, self.models_dir, self._on_runner))
             with self._lock:
                 self._set("stopped", "")
-        except VisionUnavailable as exc:   # expected on Raspberry Pi 4 robots: explain, don't crash
-            log.warning("vision unavailable: %s", exc)
+        except models.ModelError as exc:
+            log.error("%s", exc)
             with self._lock:
                 self._set("error", str(exc))
         except Exception as exc:   # surfaced on the settings page; the app itself keeps running

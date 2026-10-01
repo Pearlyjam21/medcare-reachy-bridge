@@ -33,15 +33,17 @@ class Robot(Protocol):
 
 def crop_4_3(frame: np.ndarray) -> np.ndarray:
     """Centre-crop a wide frame to 4:3 and resize to 640x480 (spec 00 §6 M2)."""
-    import cv2
-
     height, width = frame.shape[:2]
     target_width = int(height * 4 / 3)
     if width > target_width:
         x = (width - target_width) // 2
         frame = frame[:, x:x + target_width]
     if frame.shape[1] != FRAME_WIDTH or frame.shape[0] != FRAME_HEIGHT:
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+        from PIL import Image   # Pillow, not OpenCV: nothing on the robot needs OpenCV
+
+        resized = Image.fromarray(np.ascontiguousarray(frame)).resize(
+            (FRAME_WIDTH, FRAME_HEIGHT), Image.Resampling.BOX)
+        frame = np.asarray(resized)
     return frame
 
 

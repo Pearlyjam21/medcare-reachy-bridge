@@ -1,23 +1,23 @@
-"""MediaPipe model files, downloaded once from Google's official storage and verified by SHA-256.
+"""The six vision models, shipped inside this app and checked by SHA-256 before use.
 
-The hashes are the exact files the web app's browser worker and the bridge tests use, so the robot runs
-byte-identical models.
+They are the browser worker's MediaPipe Tasks models (face_landmarker, hand_landmarker, pose_landmarker_lite;
+Apache-2.0) converted to ONNX, plus OpenCV Zoo's ONNX export of the same MediaPipe pose detector (its TFLite
+original uses sparse weights the converter can't read). tools/MODELS.md records how they were made. Nothing is
+downloaded at run time; a damaged or altered install stops with a clear message.
 """
 
 import hashlib
-import urllib.request
 from pathlib import Path
 
-_BASE = "https://storage.googleapis.com/mediapipe-models"
+DEFAULT_DIR = Path(__file__).resolve().parent / "vision_models"
 MODELS = {
-    "face_landmarker.task": (f"{_BASE}/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-                             "64184e229b263107bc2b804c6625db1341ff2bb731874b0bcc2fe6544e0bc9ff"),
-    "hand_landmarker.task": (f"{_BASE}/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
-                             "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1"),
-    "pose_landmarker_lite.task": (f"{_BASE}/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-                                  "59929e1d1ee95287735ddd833b19cf4ac46d29bc7afddbbf6753c459690d574a"),
+    "face_detector.onnx": "d97a63b82d1751e6dd219b842f55acc28c9656865611caeb88d7bc48f49919c4",
+    "face_landmarks_detector.onnx": "1d97e6326845df6c239b5c2662c9bec62eb761839def949e1aa0fccb8ed1b47a",
+    "hand_detector.onnx": "61c78d31e5c6c37a0ebde4c2f382db50d5116bfae0bd4be629f8a7d2aafc0f40",
+    "hand_landmarks_detector.onnx": "5ed334609f59b97a43eed7d993ce305bb49134dc4c8918ecb7471099fc51071a",
+    "pose_detector.onnx": "47fd5599d6fa17608f03e0eb0ae230baa6e597d7e8a2c8199fe00abea55a701f",
+    "pose_landmarks_detector.onnx": "cd7c2b67e1275239b80b17eab9cd861422ef6ac291370baf512c3022409a248d",
 }
-DEFAULT_DIR = Path.home() / ".medcare_reachy" / "models"
 
 
 class ModelError(RuntimeError):
@@ -32,28 +32,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _download(url: str, destination: Path) -> None:
-    with urllib.request.urlopen(url, timeout=60) as response, open(destination, "wb") as out:
-        while block := response.read(1 << 20):
-            out.write(block)
-
-
-def ensure_models(directory: Path = DEFAULT_DIR, download=_download) -> Path:
+def verify_models(directory: Path = DEFAULT_DIR, expected: dict[str, str] = MODELS) -> Path:
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    for name, (url, expected) in MODELS.items():
-        target = directory / name
-        if target.exists() and _sha256(target) == expected:
-            continue
-        partial = target.with_suffix(".part")
-        try:
-            download(url, partial)
-        except OSError as exc:
-            partial.unlink(missing_ok=True)
-            raise ModelError(f"Could not download {name}: {exc}") from exc
-        actual = _sha256(partial)
-        if actual != expected:
-            partial.unlink(missing_ok=True)
-            raise ModelError(f"{name} failed its integrity check (got {actual[:12]}…)")
-        partial.replace(target)
+    for name, digest in expected.items():
+        path = directory / name
+        if not path.is_file():
+            raise ModelError(f"Vision model {name} is missing; reinstall the app from the dashboard.")
+        if _sha256(path) != digest:
+            raise ModelError(f"Vision model {name} failed its integrity check; reinstall the app from the dashboard.")
     return directory
