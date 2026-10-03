@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medcare_reachy"
-version = "0.5.3"
+version = "0.5.4"
 description = "Medication-time companion for Reachy Mini: reminds, prompts each medicine, and watches each dose (intake and emotion) on the robot itself, for a MedAiCarePlus server."
 readme = "README.md"
 requires-python = ">=3.10"

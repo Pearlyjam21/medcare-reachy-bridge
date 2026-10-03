@@ -42,26 +42,61 @@ def _matcha(models_dir: Path):
     return sherpa_onnx.OfflineTts(config)
 
 
-MAX_CHUNK = 16   # characters per spoken chunk: short enough that the first one is ready in ~2 s
+MAX_CHUNK = 16       # comma clauses are joined up to this many characters, so the first chunk is ready in ~2 s
+MIN_FIRST_CJK = 6    # an opening comma clause with this many Chinese characters is spoken on its own
+
+_TERMINALS = "\u3002\uff01\uff1f!?\uff1b;"
+_CLOSERS = "\u300d\u300f\uff09)\u300b\"'\u201d\u2019"
+# After \uff0c\u3001 and after a comma, except inside a number such as 1,000.
+_CLAUSE_BREAK = re.compile(r"(?<=[\uff0c\u3001])|(?<=\D,)|(?<=,)(?!\d)")
+_CJK = re.compile(r"[\u3400-\u9fff]")
+
+
+def _sentences(text: str) -> list[str]:
+    """Split after \u3002\uff01\uff1f!?\uff1b; and after a full stop followed by a space or the end.
+
+    A run such as \uff01\uff01 stays together with any closing quote or bracket after it, and a full stop inside 25.5 or
+    ... is not an end.
+    """
+    out: list[str] = []
+    start = i = 0
+    while i < len(text):
+        char = text[i]
+        i += 1
+        if char in _TERMINALS or (char == "." and (i == len(text) or text[i].isspace() or text[i] in _CLOSERS)):
+            while i < len(text) and (text[i] in _TERMINALS or text[i] in _CLOSERS):
+                i += 1
+            out.append(text[start:i])
+            start = i
+    out.append(text[start:])
+    return [sentence.strip() for sentence in out if sentence.strip()]
 
 
 def chunks(text: str | None) -> list[str]:
-    """Split a reply into sentences, and long sentences again at commas, keeping the punctuation."""
+    """Split a reply into sentences, and long sentences again at commas, keeping the punctuation.
+
+    A clause without a comma is never cut, even when it is longer than MAX_CHUNK. Each chunk is spoken with its own
+    falling tone and a pause, and a cut inside a clause splits words and numbers: the spoken dose refusals would
+    become \u660e\u5929\u65e9|\u4e0a6\u70b9 and \u5403\u6ee1 4|\u6b21\u4e86, and \u8981\u4e0d\u8981 would become \u8981|\u4e0d\u8981 ("don't").
+    The first comma clause, when it has at least MIN_FIRST_CJK Chinese characters, is a chunk of its own, so
+    Reachy starts speaking while the rest is synthesised.
+    """
     out: list[str] = []
-    for sentence in re.split(r"(?<=[。！？!?；;.])", (text or "").strip()):
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-        if len(sentence) <= MAX_CHUNK:
+    for sentence in _sentences((text or "").strip()):
+        clauses = [clause for clause in _CLAUSE_BREAK.split(sentence) if clause]
+        if len(clauses) > 1 and len(_CJK.findall(clauses[0])) >= MIN_FIRST_CJK:
+            out.append(clauses[0].strip())
+            clauses = clauses[1:]
+        elif len(sentence) <= MAX_CHUNK:
             out.append(sentence)
             continue
         current = ""
-        for part in re.split(r"(?<=[，,、])", sentence):
-            if current and len(current) + len(part) > MAX_CHUNK:
+        for clause in clauses:
+            if current and len(current) + len(clause) > MAX_CHUNK:
                 out.append(current.strip())
-                current = part
+                current = clause
             else:
-                current += part
+                current += clause
         if current.strip():
             out.append(current.strip())
     return out
