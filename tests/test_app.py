@@ -50,6 +50,19 @@ def test_public_view_never_contains_the_key():
     assert "rdv1" not in json.dumps(view) and view["device_token_set"] is True
 
 
+def test_the_check_in_mm_and_gestures_are_on_until_switched_off(tmp_path):
+    store = SettingsStore(tmp_path / "settings.json")
+    saved = store.save(GOOD)
+    assert saved["checkin_ack"] is True and saved["checkin_gestures"] is True
+    saved = store.save({"checkin_gestures": False})               # e.g. the settings page's checkbox
+    assert saved["checkin_ack"] is True and saved["checkin_gestures"] is False
+    assert public_view(store.load())["checkin_gestures"] is False
+    assert public_view(GOOD)["checkin_ack"] is True                 # settings saved before 0.5.2
+    for bad in ({"checkin_ack": "no"}, {"checkin_gestures": 0}):
+        with pytest.raises(SettingsError):
+            store.save(bad)
+
+
 # ── models ──
 def test_bundled_models_match_their_pinned_hashes():
     assert models.verify_models() == models.DEFAULT_DIR
@@ -97,7 +110,8 @@ class FakeRunner:
         self.slot = None
         self.robot_reachable = True
         self.clips = type("C", (), {"missing_count": 11})()
-        self.stream = type("S", (), {"landmark_fps": lambda self: 9.84, "vision_fps": lambda self: 4.0})()
+        self.stream = type("S", (), {"landmark_fps": lambda self: 9.84, "vision_fps": lambda self: 4.0,
+                                     "camera_fps": lambda self: 10.04})()
 
     def request_shutdown(self):
         self.stopping.set()
@@ -136,6 +150,7 @@ def test_service_runs_reports_and_stops(tmp_path):
     assert wait_for(lambda: service.status()["state"] == "running")
     status = service.status()
     assert status["landmark_fps"] == 9.8 and status["missing_clips"] == 11 and status["robot_reachable"] is True
+    assert status["camera_fps"] == 10.0   # what the camera delivers: the ceiling for the landmark rate
     service.stop()
     assert service.status()["state"] == "stopped" and runs[0]["capture_fps"] == 10.0
 
@@ -209,8 +224,20 @@ def test_status_describes_the_current_step_during_a_task(tmp_path):
 # ── the real default bridge ──
 def test_damaged_install_stops_with_a_clear_status_instead_of_crashing(tmp_path):
     store = SettingsStore(tmp_path / "s.json")
-    store.save(GOOD)
+    store.save({**GOOD, "vision_on_server": False})   # on-robot vision needs the bundled models
     service = BridgeService(object(), store, models_dir=tmp_path / "empty")   # real default_bridge
     service.start()
     assert wait_for(lambda: service.status()["state"] == "error")
     assert "reinstall the app" in service.status()["detail"]
+
+
+def test_server_vision_runs_without_the_vision_models(tmp_path):
+    store = SettingsStore(tmp_path / "s.json")
+    store.save(GOOD)
+    assert store.load()["vision_on_server"] is True   # the default
+    service = BridgeService(object(), store, models_dir=tmp_path / "empty")   # real default_bridge
+    service.start()
+    try:
+        assert wait_for(lambda: service.status()["state"] == "running")
+    finally:
+        service.stop()

@@ -38,8 +38,20 @@
           </select>
         </label>
         <label>Camera rate (frames per second)
-          <input name="capture_fps" type="number" min="1" max="15" step="1" value="10">
-          <small>The robot's camera feed tops out near 10 fps; below 12 fps the server sends every dose to a family member to confirm.</small>
+          <input name="capture_fps" type="number" min="1" max="15" step="1" value="15">
+          <small>Keep 15. Below 12 fps the server sends every dose to a family member to confirm. "Camera feed" above shows what the robot's camera actually delivers: Reachy Mini's own software caps it at 10 fps until it is raised when the app is deployed.</small>
+        </label>
+        <label class="check">
+          <input name="checkin_ack" type="checkbox" checked>
+          <span>Answer each pause, then say it is thinking
+            <small>In a check-in chat, Reachy answers each pause at once with 「嗯」, then, once it has the patient's words, says a short phrase such as 「我再想一下喔。」 while it works out its reply.</small>
+          </span>
+        </label>
+        <label class="check">
+          <input name="checkin_gestures" type="checkbox" checked>
+          <span>Move while thinking and speaking
+            <small>In a check-in chat, Reachy tilts its head, turns slowly and moves its antennas while it prepares a reply, and moves its antennas while it speaks.</small>
+          </span>
         </label>
         <button type="submit">Save and connect</button>
         <p id="form-error" class="error" role="alert"></p>

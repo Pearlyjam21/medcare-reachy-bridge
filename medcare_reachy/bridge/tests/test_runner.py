@@ -3,6 +3,7 @@ import asyncio
 import numpy as np
 
 from medcare_reachy.bridge import __version__
+from medcare_reachy.bridge import runner as runner_module
 from medcare_reachy.bridge.app_client import AppUnreachable, NotAuthorised, SessionLost
 from medcare_reachy.bridge.runner import MonitorStream, Runner
 from medcare_reachy.bridge.tests.fakes import FakeClips, FakeRobot, FakeStream, dose, make_task
@@ -28,6 +29,9 @@ class Camera:
     def get_frame(self):
         self.grabs += 1
         return self.frame
+
+    def get_camera_frame(self):
+        return self.get_frame()
 
 
 class Engine:
@@ -62,6 +66,241 @@ def make_stream():
     clock, app, camera = Clock(), StreamApp(), Camera()
     stream = MonitorStream(app, camera, Engine(), clock=clock, run_blocking=inline, encode=lambda frame: b"jpg")
     return stream, app, camera, clock
+
+
+class FrameApp:
+    """The server-vision endpoint: the robot sends JPEGs, the server answers with the session state."""
+
+    def __init__(self):
+        self.frames = []
+        self.gate = None
+        self.unreachable_since = None
+
+    async def monitor_frame(self, session_id, generation, frame_seq, timestamp, jpeg):
+        self.frames.append((session_id, generation, frame_seq, timestamp, jpeg))
+        if self.gate:
+            await self.gate.wait()
+        return {"session_id": session_id, "frame_seq": frame_seq, "identity_status": "verified"}
+
+
+def make_server_stream(fps=15.0):
+    clock, app, camera = Clock(), FrameApp(), Camera()
+    stream = MonitorStream(app, camera, None, clock=clock, run_blocking=inline, encode=lambda frame: b"big",
+                           stream_encode=lambda frame: b"jpg", fps=fps)
+    return stream, app, camera, clock
+
+
+def test_server_vision_streams_jpegs_with_capture_timestamps():
+    stream, app, camera, clock = make_server_stream()
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        for _ in range(3):
+            await stream.step()
+            await stream.drain()
+            clock.t += 1 / 15
+
+    asyncio.run(scenario())
+    assert [frame[2] for frame in app.frames] == [1, 2, 3]
+    assert app.frames[0][:2] == ("s1", "g1") and app.frames[0][4] == b"jpg"
+    assert app.frames[0][3] == 50.0 and abs(app.frames[1][3] - (50 + 1 / 15)) < 1e-9
+    assert stream.latest["frame_seq"] == 3 and stream.landmark_fps() > 0
+
+
+def test_server_vision_keeps_a_few_frames_in_flight_then_drops_rather_than_queues():
+    stream, app, camera, clock = make_server_stream()
+
+    async def scenario():
+        app.gate = asyncio.Event()
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        for _ in range(stream.max_in_flight):
+            await stream.step()       # slow network: these stay in flight together
+            clock.t += 1 / 15
+        await asyncio.sleep(0)        # let the send tasks start
+        assert [frame[2] for frame in app.frames] == [1, 2, 3]
+        await stream.step()           # every slot busy for the whole wait: dropped
+        assert len(app.frames) == 3 and camera.grabs == 4
+        app.gate.set()
+        await stream.drain()
+        await stream.step()
+        await stream.drain()
+
+    asyncio.run(scenario())
+    assert [frame[2] for frame in app.frames] == [1, 2, 3, 4]   # sequence numbers stay contiguous
+    assert stream._frames_in_flight == 0
+
+
+def stream_camera(stream, clock, frame_times):
+    """Hand the stream one camera frame at each time, as the loop would when the camera delivers it."""
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        for at in frame_times:
+            clock.t = at
+            await stream.step()
+            await stream.drain()
+
+    asyncio.run(scenario())
+
+
+def test_server_stream_takes_every_frame_of_a_15_fps_camera_despite_jitter():
+    stream, app, camera, clock = make_server_stream()
+    jitter = [0.004, -0.004, 0.003, -0.002, 0.0]
+    times = [50 + i / 15 + jitter[i % len(jitter)] for i in range(45)]
+    stream_camera(stream, clock, times)
+    assert len(app.frames) == 45    # a strict 1/15 s gate would drop each frame that came a few ms early
+    assert [frame[3] for frame in app.frames] == times
+
+
+def test_server_stream_sends_at_most_15_fps_from_a_faster_camera():
+    stream, app, camera, clock = make_server_stream()
+    stream_camera(stream, clock, [50 + i / 30 for i in range(90)])    # 3 s at 30 fps
+    assert len(app.frames) == 45 and camera.grabs == 90
+    gaps = {round(b[3] - a[3], 3) for a, b in zip(app.frames, app.frames[1:])}
+    assert gaps == {round(2 / 30, 3)}
+
+
+def test_a_lower_stream_rate_keeps_its_schedule_on_a_15_fps_camera():
+    stream, app, camera, clock = make_server_stream(fps=10.0)
+    stream_camera(stream, clock, [50 + i / 15 for i in range(45)])    # 3 s
+    assert len(app.frames) == 30                                       # 2 frames in 3, not every other one
+
+
+def test_after_the_camera_stalls_the_stream_does_not_burst_to_catch_up():
+    stream, app, camera, clock = make_server_stream()
+    times = [50 + i / 15 for i in range(15)] + [52 + i / 30 for i in range(30)]   # 1 s stall, then 30 fps
+    stream_camera(stream, clock, times)
+    later = [frame[3] for frame in app.frames if frame[3] >= 52]
+    assert all(b - a > 0.06 for a, b in zip(later, later[1:]))
+
+
+def test_camera_rate_is_measured_and_a_slow_camera_is_logged_once(caplog):
+    stream, app, camera, clock = make_server_stream()
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        stream_camera(stream, clock, [50 + i / 10 for i in range(150)])    # 15 s at 10 fps, the daemon's cap
+    assert len(app.frames) == 150
+    assert 9.8 <= stream.camera_fps() <= 10.2 and 9.8 <= stream.landmark_fps() <= 10.2
+    warnings = [r.getMessage() for r in caplog.records if "camera hands this app only" in r.getMessage()]
+    assert len(warnings) == 1 and "IPC_FPS" in warnings[0]
+
+
+def test_a_15_fps_camera_is_not_reported_as_slow(caplog):
+    stream, app, camera, clock = make_server_stream()
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        stream_camera(stream, clock, [50 + i / 15 for i in range(225)])
+    assert stream.camera_fps() >= 14.5
+    assert not [r for r in caplog.records if "camera hands this app only" in r.getMessage()]
+
+
+def stall_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("server stream:")]
+
+
+def test_a_steady_stream_logs_no_stall(caplog):
+    stream, app, camera, clock = make_server_stream()
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        stream_camera(stream, clock, [50 + i / 15 for i in range(45)])
+    assert stall_lines(caplog) == []
+
+
+def test_a_camera_stall_is_logged_with_how_long_the_camera_gave_nothing(caplog):
+    stream, app, camera, clock = make_server_stream()
+
+    async def scenario():
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        await stream.step()                  # frame 1 at 50.0
+        await stream.drain()
+        frame, camera.frame = camera.frame, None
+        for i in range(1, 21):               # 1 s of polls with no new camera frame
+            clock.t = 50 + i * 0.05
+            await stream.step()
+        camera.frame = frame
+        clock.t = 51.1
+        await stream.step()                  # frame 2
+        await stream.drain()
+
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        asyncio.run(scenario())
+    [line] = stall_lines(caplog)
+    assert "1.10 s between frames before frame 2" in line
+    assert "longest wait for a camera frame 1.05 s" in line and "free request slot: 0 " in line
+
+
+def test_a_server_or_wifi_stall_is_logged_with_the_dropped_frames_and_the_oldest_request(caplog, monkeypatch):
+    monkeypatch.setattr(runner_module, "FRAME_WAIT_STEPS", 1)
+    stream, app, camera, clock = make_server_stream()
+
+    async def scenario():
+        app.gate = asyncio.Event()           # no answers: the requests stay in flight
+        stream.attach({"session_id": "s1", "generation": "g1"})
+        for i in range(15):                  # 1 s at 15 fps: 3 go out, 12 find no free slot
+            clock.t = 50 + i / 15
+            await stream.step()
+        app.gate.set()
+        await stream.drain()
+        clock.t = 51.0
+        await stream.step()                  # frame 4, 0.87 s after frame 3
+        await stream.drain()
+
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        asyncio.run(scenario())
+    assert [frame[2] for frame in app.frames] == [1, 2, 3, 4]
+    [line] = stall_lines(caplog)
+    assert "0.87 s between frames before frame 4" in line
+    assert "free request slot: 12 (oldest unanswered request 0.93 s)" in line
+
+
+def test_stall_lines_are_rate_limited_and_count_the_gaps_between_them(caplog):
+    stream, app, camera, clock = make_server_stream()
+    times = [50 + i * 0.5 for i in range(12)]    # a 2 fps camera: every gap is a stall, for 5.5 s
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        stream_camera(stream, clock, times)
+    lines = stall_lines(caplog)
+    assert len(lines) == 6                         # at 50.5, 51.5, ... 55.5
+    assert "(1 gap(s)" in lines[0] and all("(2 gap(s)" in line for line in lines[1:])
+
+
+def test_loop_waits_for_the_next_frame_only_while_streaming():
+    stream, app, camera, clock = make_server_stream()
+    assert abs(stream._pause(clock.t) - 1 / 15) < 1e-9          # idle: one interval, never a busy loop
+    stream_camera(stream, clock, [50.0])
+    assert abs(stream._pause(clock.t) - 0.8 / 15) < 1e-9        # just sent: sleep until the next may go out
+    clock.t += 1
+    assert stream._pause(clock.t) == 0.005                       # overdue: poll the camera again soon
+
+
+def test_streamed_frames_are_smaller_than_the_camera_frame():
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from medcare_reachy.bridge.runner import STREAM_SIZE, encode_jpeg, encode_stream_jpeg
+
+    frame = (np.random.default_rng(0).integers(0, 255, (480, 640, 3), dtype=np.uint8) // 16 * 16)
+    small = encode_stream_jpeg(frame)
+    assert Image.open(io.BytesIO(small)).size == STREAM_SIZE
+    assert len(small) < len(encode_jpeg(frame)) * 0.7
+
+
+def test_stream_jpeg_from_the_wireless_camera_frame_is_its_4_3_centre_in_rgb():
+    import io
+
+    from PIL import Image
+
+    from medcare_reachy.bridge.runner import STREAM_SIZE, encode_stream_jpeg
+
+    frame = np.zeros((720, 1280, 3), np.uint8)    # BGR, as the SDK hands it over
+    frame[:, :160] = (0, 255, 0)                   # outside the 4:3 centre: must not show
+    frame[:, 1120:] = (0, 255, 0)
+    frame[:, 160:640] = (255, 0, 0)                # left half of the centre: blue
+    frame[:, 640:1120] = (0, 0, 255)               # right half: red
+    image = Image.open(io.BytesIO(encode_stream_jpeg(frame))).convert("RGB")
+    assert image.size == STREAM_SIZE
+    pixels = np.asarray(image).astype(int)
+    left, right = pixels[:, 4:236].mean(axis=(0, 1)), pixels[:, 244:476].mean(axis=(0, 1))
+    assert left[2] > 200 and left[0] < 40 and left[1] < 40      # blue stays blue
+    assert right[0] > 200 and right[2] < 40 and right[1] < 40    # red stays red
+    assert pixels[:, [0, -1], 1].mean() < 40                      # no green bars: the sides were cropped
 
 
 def test_no_session_means_no_capture():
@@ -218,6 +457,7 @@ class StubStream:
 class StubSlot:
     def __init__(self):
         self.stopped = None
+        self.task = {"microphone": True}
 
     def stop(self, reason, abort=True):
         self.stopped = (reason, abort)
@@ -244,10 +484,19 @@ def test_heartbeat_not_authorised_stops_and_unreachable_does_not():
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert runner.slot.stopped == ("stop_all", True)
+    assert runner.slot.task["microphone"] is False
     runner = heartbeat_runner(HeartbeatApp(error=AppUnreachable("x")))
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert runner.slot.stopped is None
+    assert runner.slot.task["microphone"] is True   # no answer: keep what the task said
+
+
+def test_heartbeat_microphone_consent_reaches_the_running_slot():
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False, "microphone": False}))
+    runner.slot = StubSlot()
+    asyncio.run(runner.heartbeat_once())
+    assert runner.slot.task["microphone"] is False and runner.slot.stopped is None
 
 
 class TaskApp:
@@ -281,6 +530,34 @@ def test_task_loop_resumes_the_held_task_first_then_polls():
     assert app.calls == ["tasks_current", "status:aborted", "tasks_next:25"]
 
 
+def test_shutdown_does_not_wait_out_the_task_long_poll():
+    class PollingApp:
+        unreachable_since = None
+
+        async def tasks_current(self):
+            return None
+
+        async def tasks_next(self, wait):
+            await asyncio.sleep(wait)   # the server's 25 s long poll
+
+        async def heartbeat(self, payload):
+            return {}
+
+    stream = StubStream()
+    stream.run = lambda stop: stop.wait()
+    runner = Runner(app=PollingApp(), robot=FakeRobot(), clips=FakeClips(), stream=stream, run_blocking=inline)
+
+    async def scenario():
+        started = asyncio.get_running_loop().time()
+        run = asyncio.create_task(runner.run())
+        await asyncio.sleep(0.05)
+        runner.request_shutdown()
+        await asyncio.wait_for(run, 2)
+        return asyncio.get_running_loop().time() - started
+
+    assert asyncio.run(scenario()) < 1
+
+
 def test_shutdown_during_a_slot_keeps_the_lease():
     ref = []
     app = TaskApp(ref)
@@ -290,6 +567,14 @@ def test_shutdown_during_a_slot_keeps_the_lease():
     slot = asyncio.run(runner.run_slot(make_task([dose(1)])))
     assert slot.result == "bridge_shutdown" and robot.calls == ["sleep"]
     assert not [call for call in app.calls if call.startswith("status:")]
+
+
+def test_the_settings_switch_the_check_in_mm_and_gestures_for_every_slot():
+    runner = Runner(app=TaskApp([]), robot=FakeRobot(), clips=FakeClips(), stream=FakeStream(), tick_seconds=0,
+                    run_blocking=inline, ack=False, gestures=False)
+    runner.request_shutdown()
+    slot = asyncio.run(runner.run_slot(make_task([dose(1)])))
+    assert slot.ack is False and slot.gestures is False
 
 
 def test_after_failing_closed_on_app_loss_the_held_task_is_resumed_via_tasks_current():

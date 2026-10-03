@@ -1,0 +1,11 @@
+inquiring3.json is Pollen Robotics' recorded emotion move "inquiring3" ("A fast movement that lets you ask a
+question") from the Reachy Mini Emotions Library, the moves the Reachy Mini Control dashboard plays:
+
+    https://huggingface.co/datasets/pollen-robotics/reachy-mini-emotions-library
+    revision 873ae49f0b89114b7e535eff0c1f7560d21d9357 (7 Jul 2026), file inquiring3.json, unmodified
+    sha256 dcaaf83b8ee6ec19cde32df8fea9117103fc9ca55ac52c96168d0f11abaafc86
+
+Copyright Pollen Robotics. Licensed under the Apache License, Version 2.0:
+    https://www.apache.org/licenses/LICENSE-2.0
+
+The move's sound (inquiring3.ogg) is not included and never played: Reachy's own audio pipeline carries its speech.

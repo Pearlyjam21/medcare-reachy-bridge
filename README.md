@@ -39,6 +39,9 @@ is downloaded at run time.
 - Reminds, finds the patient, prompts each medicine, and watches for hand-to-mouth movement. **It cannot identify
   which pill was taken or how many.**
 - Never decides on its own that a dose was taken; the server records under its own policy.
+- Follows the server's overdose protection: when the server refuses a dose (not due yet, too soon after the last one,
+  the day's maximum reached, or missed too long ago), the robot says the server's one-sentence reason once and moves
+  on to the next medicine. It never retries that dose in the same reminder.
 - Fails safe: stops and puts the robot to sleep if the server is unreachable or the robot key is revoked.
 - No microphone in this version.
 - **Not a medical device.** Prototype software. Prompt wording is pending clinician review, and no voice clips are

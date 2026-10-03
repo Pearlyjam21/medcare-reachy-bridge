@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "note": "Prerecorded prompts. WAV files live at <CLIPS_DIR>/<language>/<clip_id>.wav (mono, 16-bit). Optional per-medication prompts may be added as med_<med_id>.wav; without one, med_prompt_generic is played. No clip may mention other doses or the rest of the day. All text must pass clinician review before release.",
+  "note": "Prerecorded prompts. WAV files live at <CLIPS_DIR>/<language>/<clip_id>.wav (mono, 16-bit). Optional per-medication prompts may be added as med_<med_id>.wav; without one, med_prompt_generic is played. A group listed under variants plays one of its clips each time, in turn, or nothing when none has a WAV (the check-in's thinking phrase, said after the ack 嗯 once the patient's words are handed over). No clip may mention other doses or the rest of the day. All text must pass clinician review before release.",
   "clips": {
     "wake_greeting": {
       "zh-TW": "您好！吃藥的時間到了。",
@@ -27,6 +27,11 @@
       "en": "I'll wait until you finish on the tablet.",
       "review_status": "pending_clinician_review"
     },
+    "say_when_done": {
+      "zh-TW": "吃完藥以後，請跟我說「我吃完了」。",
+      "en": "When you have taken it, please tell me: I'm finished.",
+      "review_status": "pending_clinician_review"
+    },
     "med_prompt_generic": {
       "zh-TW": "請現在吃下一種藥。",
       "en": "Please take your next medicine now.",
@@ -38,8 +43,8 @@
       "review_status": "pending_clinician_review"
     },
     "confirm_with_caregiver": {
-      "zh-TW": "謝謝您。我會請家人確認這種藥。",
-      "en": "Thank you. I'll ask your family to confirm this medicine.",
+      "zh-TW": "我沒辦法確定您吃了沒，會請家人幫忙看看。請先別再吃一次喔。",
+      "en": "I can't be sure you took it, so I'll ask your family to check. Please don't take it again for now.",
       "review_status": "pending_clinician_review"
     },
     "help": {
@@ -56,7 +61,30 @@
       "zh-TW": "謝謝您！",
       "en": "Thank you!",
       "review_status": "pending_clinician_review"
+    },
+    "ack": {
+      "zh-TW": "嗯",
+      "en": "Mm-hm.",
+      "review_status": "pending_clinician_review"
+    },
+    "thinking_1": {
+      "zh-TW": "我再想一下喔。",
+      "en": "Let me think a moment.",
+      "review_status": "pending_clinician_review"
+    },
+    "thinking_2": {
+      "zh-TW": "讓我想一想喔。",
+      "en": "Let me think about that.",
+      "review_status": "pending_clinician_review"
+    },
+    "thinking_3": {
+      "zh-TW": "我想想看喔。",
+      "en": "Let me think it over.",
+      "review_status": "pending_clinician_review"
     }
+  },
+  "variants": {
+    "thinking": ["thinking_1", "thinking_2", "thinking_3"]
   },
   "per_medication": {
     "file_pattern": "med_<med_id>.wav",

@@ -24,6 +24,9 @@ label { display: grid; gap: 4px; font-weight: 500; }
 input, select { font: inherit; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px;
                 background: var(--bg); color: var(--text); min-height: 44px; }
 small { font-weight: 400; }
+label.check { display: flex; gap: 10px; align-items: flex-start; }
+label.check input { min-height: 0; width: 20px; height: 20px; margin: 2px 0 0; flex: none; }
+label.check small { display: block; }
 button { font: inherit; font-weight: 600; min-height: 44px; padding: 10px 18px; border-radius: 10px; border: 0;
          background: var(--accent); color: #fff; cursor: pointer; }
 button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--border); }

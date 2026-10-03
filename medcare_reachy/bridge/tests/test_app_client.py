@@ -5,7 +5,8 @@ import httpx
 import pytest
 
 from medcare_reachy.bridge.app_client import (
-    AppClient, AppUnreachable, BusyOtherClient, NotAuthorised, RequestRejected, ServiceUnavailable, SessionLost)
+    DOSE_REFUSALS, AppClient, AppUnreachable, BusyOtherClient, DoseRefused, NotAuthorised, RequestRejected,
+    ServiceUnavailable, SessionLost)
 
 
 class Clock:
@@ -73,6 +74,62 @@ def test_409_raises_session_lost_and_busy_other_client_is_distinguished():
         run(scenario("busy_other_client"))
     with pytest.raises(BusyOtherClient):
         run(scenario({"code": "busy_other_client", "message": "tablet"}))
+
+
+TOO_SOON = {"detail": "dose_too_soon", "intk_id": 4, "med_name": "allegra",
+            "scheduled_time": "2026-10-03T08:00:00+08:00", "last_taken_at": "2026-10-03T00:05:00+08:00",
+            "next_allowed_at": "2026-10-03T06:05:00+08:00", "reply": "這個藥您凌晨12點05分已經吃過了，請先不要再吃。",
+            "speech_text": "这个药您凌晨12点05分已经吃过了，请先不要再吃。"}
+
+
+@pytest.mark.parametrize("call", ["start", "confirmation"])
+def test_overdose_refusal_keeps_the_whole_409_body(call):
+    async def scenario():
+        async with make_client(lambda request: httpx.Response(409, json=TOO_SOON)) as client:
+            if call == "start":
+                await client.monitor_start("dose", intk_id=4, task_id="t1")
+            else:
+                await client.confirmation("t1", 4, "patient_claim", {"said_done": True})
+
+    with pytest.raises(DoseRefused) as info:
+        run(scenario())
+    refused = info.value
+    assert isinstance(refused, SessionLost) and not isinstance(refused, BusyOtherClient)
+    assert refused.status == 409 and refused.detail == "dose_too_soon" and refused.body == TOO_SOON
+    assert refused.intk_id == 4 and refused.speech_text == TOO_SOON["speech_text"]
+
+
+@pytest.mark.parametrize("code", sorted(DOSE_REFUSALS))
+def test_every_refusal_code_and_a_nested_body_raise_dose_refused(code):
+    async def scenario(body):
+        async with make_client(lambda request: httpx.Response(409, json=body)) as client:
+            await client.monitor_start("dose", intk_id=4, task_id="t1")
+
+    with pytest.raises(DoseRefused) as flat:
+        run(scenario({**TOO_SOON, "detail": code}))
+    assert flat.value.detail == code and flat.value.body["last_taken_at"] == TOO_SOON["last_taken_at"]
+    with pytest.raises(DoseRefused) as nested:   # an HTTPException with a dict detail
+        run(scenario({"detail": {**TOO_SOON, "detail": code}}))
+    assert nested.value.detail == code and nested.value.speech_text == TOO_SOON["speech_text"]
+
+
+def test_refusal_without_a_sentence_and_other_409s():
+    async def scenario(body):
+        async with make_client(lambda request: httpx.Response(409, json=body)) as client:
+            await client.monitor_start("dose", intk_id=4, task_id="t1")
+
+    older = {"detail": "dose_not_due_yet", "intk_id": 4, "scheduled_time": "2026-10-03T20:00:00+08:00",
+             "due_from": "2026-10-03T18:00:00+08:00"}
+    with pytest.raises(DoseRefused) as info:
+        run(scenario(older))
+    assert info.value.speech_text is None and info.value.body == older
+    with pytest.raises(DoseRefused) as blank:
+        run(scenario({**TOO_SOON, "speech_text": "  ", "intk_id": "4"}))
+    assert blank.value.speech_text is None and blank.value.intk_id is None
+    with pytest.raises(SessionLost) as plain:
+        run(scenario({"detail": "Dose is unavailable or does not belong to this account"}))
+    assert not isinstance(plain.value, DoseRefused)
+    assert plain.value.body == {"detail": "Dose is unavailable or does not belong to this account"}
 
 
 def test_503_and_other_4xx():
@@ -162,3 +219,62 @@ def test_request_bodies_for_every_route():
     for field in ('name="session_id"', 'name="generation"', 'name="frame_seq"', 'name="file"; filename="frame.jpg"'):
         assert field in body
     assert "image/jpeg" in body
+
+
+def test_conversation_turns_carry_timings_and_reachys_timings_go_to_its_turn():
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, json.loads(request.content),
+                     request.extensions["timeout"]["read"]))
+        if request.url.path.endswith("/turn"):
+            return httpx.Response(200, json={"reply": "好", "speech_text": "好", "end": False, "risk": False,
+                                             "reply_turn_id": 7, "server_ms": 900})
+        return httpx.Response(200, json={"ok": True})
+
+    async def scenario():
+        async with make_client(handler) as client:
+            answer = await client.conversation_turn("c1", "你好", {"handover_ms": 350, "listen_mode": "chat"})
+            await client.conversation_turn("c1", "再見")
+            ok = await client.conversation_turn_metrics("c1", 7, {"round_trip_ms": 1800, "tts_chunks": 2})
+            return answer, ok
+
+    answer, ok = run(scenario())
+    assert answer["reply_turn_id"] == 7 and ok == {"ok": True}
+    assert seen == [
+        ("POST", "/api/device/conversations/c1/turn", {"text": "你好", "metrics": {"handover_ms": 350,
+                                                                                 "listen_mode": "chat"}}, 60),
+        ("POST", "/api/device/conversations/c1/turn", {"text": "再見", "metrics": None}, 60),
+        ("POST", "/api/device/conversations/c1/turns/7/metrics", {"metrics": {"round_trip_ms": 1800,
+                                                                             "tts_chunks": 2}}, 3.0)]
+
+
+def test_refused_timings_raise_like_any_other_request():
+    async def scenario():
+        async with make_client(lambda request: httpx.Response(404, json={"detail": "turn_not_found"})) as client:
+            await client.conversation_turn_metrics("c1", 99, {"round_trip_ms": 1})
+
+    with pytest.raises(RequestRejected) as info:
+        run(scenario())
+    assert info.value.status == 404
+
+
+@pytest.mark.parametrize("failure", ["timeout", "server_error"])
+def test_failed_timings_raise_but_never_start_an_outage(failure):
+    def handler(request):
+        if request.url.path.endswith("/metrics"):
+            if failure == "timeout":
+                raise httpx.ReadTimeout("slow", request=request)
+            return httpx.Response(502)
+        raise httpx.ConnectError("refused", request=request)
+
+    async def scenario():
+        async with make_client(handler) as client:
+            with pytest.raises(AppUnreachable):
+                await client.conversation_turn_metrics("c1", 7, {"round_trip_ms": 1800})
+            assert client.unreachable_since is None      # timings only: the slot must not fail closed on them
+            with pytest.raises(AppUnreachable):
+                await client.conversation_turn("c1", "你好")
+            return client.unreachable_since              # the conversation itself still counts
+
+    assert run(scenario()) == 100.0

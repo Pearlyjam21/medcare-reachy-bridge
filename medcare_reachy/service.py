@@ -22,6 +22,7 @@ STEP_TEXT = {
     "MED_PROMPT": "Asking the patient to take a medicine.",
     "WATCHING": "Watching the patient take a medicine.",
     "POST_SLOT_OBSERVE": "Watching for a few more minutes after the last medicine.",
+    "CHECKIN": "Chatting with the patient.",
     "WIND_DOWN": "Finishing the reminder.",
 }
 
@@ -32,24 +33,40 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
     from medcare_reachy.bridge.clips import ClipPlayer
     from medcare_reachy.bridge.media import ReachyRobot
     from medcare_reachy.bridge.runner import MonitorStream, Runner
-    from medcare_reachy.bridge.emotion import EmotionEngine
-    from medcare_reachy.bridge.vision import VisionEngine   # ONNX Runtime; no MediaPipe, no AES needed
+    from medcare_reachy.bridge.speech import Speaker
+    from medcare_reachy.bridge.voice import DoneListener
 
-    await asyncio.to_thread(models.verify_models, models_dir)
-    engine = await asyncio.to_thread(VisionEngine, models_dir)
-    emotion = await asyncio.to_thread(EmotionEngine, models_dir / models.EMOTION_MODEL)
+    engine = emotion = None
+    if not settings.get("vision_on_server", True):
+        # On-robot landmarks (~3 fps on a Pi 4): sessions stay below the server's recording rate.
+        from medcare_reachy.bridge.emotion import EmotionEngine
+        from medcare_reachy.bridge.vision import VisionEngine   # ONNX Runtime; no MediaPipe, no AES needed
+
+        await asyncio.to_thread(models.verify_models, models_dir)
+        engine = await asyncio.to_thread(VisionEngine, models_dir)
+        emotion = await asyncio.to_thread(EmotionEngine, models_dir / models.EMOTION_MODEL)
     robot = ReachyRobot.attach(reachy_mini)
     clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
     clips.audit()
+    # A check-in turn Reachy answered with its 「嗯」 is followed, once handed over, by a thinking phrase.
+    voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud)
+    voice.start()
+    speaker = Speaker(robot)
+    speaker.preload()
     try:
         async with AppClient(settings["app_url"], settings["device_token"]) as app:
-            runner = Runner(app=app, robot=robot, clips=clips,
+            runner = Runner(app=app, robot=robot, clips=clips, voice=voice, speaker=speaker,
+                            language=settings["language"],
                             stream=MonitorStream(app, robot, engine, fps=float(settings["capture_fps"]),
-                                                 emotion=emotion))
+                                                 emotion=emotion),
+                            ack=settings.get("checkin_ack", True), gestures=settings.get("checkin_gestures", True))
             on_runner(runner)
             await runner.run()
     finally:
-        engine.close()
+        voice.stop()
+        robot.close()   # stops any gesture; the app runtime keeps the connection
+        if engine is not None:
+            engine.close()
 
 
 class BridgeService:
@@ -85,7 +102,7 @@ class BridgeService:
             if not SettingsStore.configured(settings):
                 self._set("not_configured", "Enter the server address and robot key on this page.")
                 return
-            self._set("starting", "Loading the vision models and connecting to the server…")
+            self._set("starting", "Connecting to the server…")
             self._thread = threading.Thread(target=self._thread_main, args=(settings,),
                                             name="medcare-bridge", daemon=True)
             self._thread.start()
@@ -108,6 +125,11 @@ class BridgeService:
         self.stop()
         self.start()
 
+    def _current(self) -> bool:
+        """Whether the calling bridge thread is still the service's one: a thread that outlived stop()'s
+        timeout must not overwrite the state of the bridge that replaced it."""
+        return self._thread is threading.current_thread()
+
     def _thread_main(self, settings: dict) -> None:
         loop = asyncio.new_event_loop()
         with self._lock:
@@ -115,25 +137,30 @@ class BridgeService:
         try:
             loop.run_until_complete(self.bridge(self.reachy_mini, settings, self.models_dir, self._on_runner))
             with self._lock:
-                self._set("stopped", "")
+                if self._current():
+                    self._set("stopped", "")
         except models.ModelError as exc:
             log.error("%s", exc)
             with self._lock:
-                self._set("error", str(exc))
+                if self._current():
+                    self._set("error", str(exc))
         except Exception as exc:   # surfaced on the settings page; the app itself keeps running
             log.exception("bridge stopped with an error")
             with self._lock:
-                self._set("error", f"{type(exc).__name__}: {exc}")
+                if self._current():
+                    self._set("error", f"{type(exc).__name__}: {exc}")
         finally:
             loop.close()
             with self._lock:
-                self._loop = None
-                self._runner = None
+                if self._current():
+                    self._loop = None
+                    self._runner = None
 
     def _on_runner(self, runner) -> None:
         with self._lock:
-            self._runner = runner
-            self._set("running", "Waiting for a medication reminder from the server.")
+            if self._current():
+                self._runner = runner
+                self._set("running", "Waiting for a medication reminder from the server.")
 
     def _set(self, state: str, detail: str) -> None:
         self._state, self._detail, self._since = state, detail, time.time()
@@ -147,6 +174,7 @@ class BridgeService:
             slot = runner.slot
             status.update({
                 "robot_reachable": runner.robot_reachable,
+                "camera_fps": round(runner.stream.camera_fps(), 1),
                 "landmark_fps": round(runner.stream.landmark_fps(), 1),
                 "vision_fps": round(runner.stream.vision_fps(), 1),
                 "missing_clips": runner.clips.missing_count,

@@ -19,6 +19,7 @@ function show(status) {
   metrics.replaceChildren();
   const rows = [
     ["Robot", status.robot_reachable == null ? null : (status.robot_reachable ? "reachable" : "unreachable")],
+    ["Camera feed", status.camera_fps == null ? null : `${status.camera_fps} fps`],
     ["Camera landmarks", status.landmark_fps == null ? null : `${status.landmark_fps} fps`],
     ["Snapshots", status.vision_fps == null ? null : `${status.vision_fps} fps`],
     ["Current step", status.slot_state],
@@ -49,6 +50,8 @@ async function loadConfig() {
   form.app_url.value = config.app_url || "";
   form.language.value = config.language;
   form.capture_fps.value = config.capture_fps;
+  form.checkin_ack.checked = config.checkin_ack !== false;
+  form.checkin_gestures.checked = config.checkin_gestures !== false;
   document.getElementById("token-hint").textContent = config.device_token_set
     ? "A robot key is saved. Leave empty to keep it, or paste a new one."
     : "Shown once when you pair the robot in the web app.";
@@ -62,6 +65,8 @@ form.addEventListener("submit", async (event) => {
     device_token: form.device_token.value.trim(),
     language: form.language.value,
     capture_fps: Number(form.capture_fps.value),
+    checkin_ack: form.checkin_ack.checked,
+    checkin_gestures: form.checkin_gestures.checked,
   };
   const response = await fetch("/api/config", {
     method: "POST",

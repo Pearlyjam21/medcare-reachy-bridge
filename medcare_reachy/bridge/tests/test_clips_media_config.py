@@ -1,4 +1,5 @@
 import sys
+import types
 import wave
 from pathlib import Path
 
@@ -10,7 +11,8 @@ from medcare_reachy.bridge.config import Settings
 from medcare_reachy.bridge.media import VideoFileRobot, crop_4_3, head_pose, read_wav, resample
 
 REQUIRED_CLIPS = {"wake_greeting", "reminder", "searching", "waiting_for_patient", "med_prompt_generic",
-                  "already_taken", "confirm_with_caregiver", "help", "wind_down", "thanks", "waiting_for_tablet"}
+                  "already_taken", "confirm_with_caregiver", "help", "wind_down", "thanks", "waiting_for_tablet",
+                  "say_when_done", "ack", "thinking_1", "thinking_2", "thinking_3"}
 
 
 class RecordingRobot:
@@ -38,6 +40,15 @@ def test_manifest_has_every_clip_in_both_languages_pending_review():
         assert entry["zh-TW"].strip() and entry["en"].strip(), clip_id
         assert entry["review_status"] == "pending_clinician_review", clip_id
     assert manifest["per_medication"]["fallback"] == "med_prompt_generic"
+
+
+def test_handing_a_dose_to_family_says_so_and_does_not_sound_like_a_confirmation():
+    """2 Oct 2026: the patient heard "thank you" and took the dose as verified, while family were asked to check."""
+    clip = load_manifest()["clips"]["confirm_with_caregiver"]
+    assert not clip["zh-TW"].startswith("謝謝") and not clip["en"].lower().startswith("thank")
+    assert "沒辦法確定" in clip["zh-TW"] and "家人" in clip["zh-TW"] and "別再吃" in clip["zh-TW"]
+    assert "can't be sure" in clip["en"] and "family" in clip["en"] and "don't take it again" in clip["en"]
+    assert len(clip["zh-TW"]) <= 30
 
 
 def test_manifest_never_talks_about_other_doses_or_the_rest_of_the_day():
@@ -118,6 +129,10 @@ def test_video_file_robot_replays_frames(tmp_path):
         if frame is not None:
             frames.append(frame)
     assert all(frame.shape == (480, 640, 3) for frame in frames)   # loops past the end
+    camera_frame = None
+    while camera_frame is None:
+        camera_frame = robot.get_camera_frame()
+    assert camera_frame.shape == (720, 1280, 3)                    # uncropped, for the server stream
     assert robot.is_reachable()
     robot.wake()
     robot.look_around(2)
@@ -177,3 +192,16 @@ def test_owned_robot_still_closes_its_own_connection():
     robot._mini = mini
     robot.close()
     assert mini.exited is True
+
+
+def test_robot_hands_the_stream_the_camera_frame_and_crops_only_for_get_frame():
+    from medcare_reachy.bridge.media import ReachyRobot
+
+    camera_frame = np.zeros((720, 1280, 3), np.uint8)
+    mini = _FakeMini()
+    mini.media = types.SimpleNamespace(get_frame=lambda: camera_frame)
+    robot = ReachyRobot.attach(mini)
+    assert robot.get_camera_frame() is camera_frame       # the server stream crops and scales in one pass
+    assert robot.get_frame().shape == (480, 640, 3)
+    mini.media = types.SimpleNamespace(get_frame=lambda: None)
+    assert robot.get_camera_frame() is None and robot.get_frame() is None
