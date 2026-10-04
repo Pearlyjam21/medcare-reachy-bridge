@@ -31,6 +31,14 @@
           <input name="device_token" type="password" placeholder="rdv1.…" autocomplete="off">
           <small id="token-hint">Shown once when you pair the robot. Leave empty to keep the current key.</small>
         </label>
+        <label>ElevenLabs API key
+          <input name="elevenlabs_api_key" type="password" autocomplete="new-password">
+          <small id="elevenlabs-key-hint">Stored privately on this robot. Leave empty to keep the saved key.</small>
+        </label>
+        <label>ElevenLabs voice ID
+          <input name="elevenlabs_voice_id" type="text" autocomplete="off" required>
+          <small>Use a voice that supports Mandarin Chinese. The default can be changed to any voice in your ElevenLabs account.</small>
+        </label>
         <label>Language
           <select name="language">
             <option value="zh-TW">繁體中文</option>

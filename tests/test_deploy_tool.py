@@ -29,7 +29,7 @@ def test_every_clip_has_simplified_words_written_for_its_current_text():
         assert deploy.spoken_text(clip_id, manifest) == spoken
 
 
-def test_a_changed_clip_is_rendered_on_a_robot_set_up_before_the_render_record():
+def test_an_old_matcha_robot_rerenders_every_clip_for_elevenlabs():
     manifest = load_manifest()
     installed = copy.deepcopy(manifest)   # the app on the robot before this deploy, with the old wording
     installed["clips"]["confirm_with_caregiver"]["zh-TW"] = "謝謝您。我會請家人確認這種藥。"
@@ -43,12 +43,15 @@ def test_a_changed_clip_is_rendered_on_a_robot_set_up_before_the_render_record()
 def test_the_render_record_decides_once_it_exists():
     manifest = load_manifest()
     record = {clip_id: entry["zh-TW"] for clip_id, entry in manifest["clips"].items()}
+    record.update({"_tts_engine": "elevenlabs", "_voice_id": "JBFqnCBsd6RMkjVDRZzb"})
     on_robot = set(manifest["clips"])
-    assert deploy.plan_clips(manifest, record, None, on_robot)[1] == []
+    assert deploy.plan_clips(manifest, record, None, on_robot, voice_id="JBFqnCBsd6RMkjVDRZzb")[1] == []
     changed = copy.deepcopy(manifest)
     changed["clips"]["help"]["zh-TW"] = "需要幫忙嗎？"
-    assert deploy.plan_clips(changed, record, None, on_robot)[1] == ["help"]
-    assert deploy.plan_clips(manifest, record, None, on_robot - {"thanks"})[1] == ["thanks"]   # WAV missing
+    assert deploy.plan_clips(changed, record, None, on_robot, voice_id="JBFqnCBsd6RMkjVDRZzb")[1] == ["help"]
+    assert deploy.plan_clips(manifest, record, None, on_robot - {"thanks"},
+                             voice_id="JBFqnCBsd6RMkjVDRZzb")[1] == ["thanks"]   # WAV missing
+    assert set(deploy.plan_clips(manifest, record, None, on_robot, voice_id="another-voice")[1]) == set(on_robot)
 
 
 def test_a_manifest_edit_without_new_simplified_words_stops_the_deploy():

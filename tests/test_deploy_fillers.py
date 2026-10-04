@@ -69,49 +69,59 @@ def test_an_unrecognised_phrase_counts_as_not_written():
 # ── the render script itself, on a fake voice and recogniser ─────────────
 
 def run_render(tmp_path, monkeypatch, job_clips, heard):
-    """Runs RENDER as the robot would, with Matcha and SenseVoice replaced: `heard[(text, speed)]` is what the
-    recogniser writes for that render. Returns (printed output, clips folder, speeds tried per text)."""
+    """Runs RENDER as the robot would with ElevenLabs and Whisper replaced."""
     tried = []
-    fake = types.ModuleType("sherpa_onnx")
 
-    class Config:
-        def __init__(self, **kwargs):
-            self.__dict__.update(kwargs)
+    class Response:
+        status_code = 200
 
-    class Tts:
-        def __init__(self, config):
+        def __init__(self, content):
+            self.content = content
+
+    class Client:
+        def __init__(self, *args, **kwargs):
             pass
 
-        def generate(self, text, sid=0, speed=1.0):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def post(self, url, *, headers, json):
+            text, speed = json["text"], json["voice_settings"]["speed"]
             tried.append((text, speed))
-            samples = np.concatenate([np.zeros(1000), np.full(int(2205 * speed), 0.3)]).astype(np.float32)
-            return types.SimpleNamespace(samples=samples, sample_rate=22050)
+            samples = np.concatenate([np.zeros(1000), np.full(int(2205 * speed), 0.3)])
+            pcm = (samples * 32767).astype("<i2").tobytes()
+            return Response(pcm)
 
-    class Recognizer:
-        @staticmethod
-        def from_sense_voice(**kwargs):
-            return Recognizer()
+    fake_httpx = types.ModuleType("httpx")
+    fake_httpx.Client = Client
+    monkeypatch.setitem(sys.modules, "httpx", fake_httpx)
+    fake_whisper = types.ModuleType("faster_whisper")
 
-        def create_stream(self):
-            return types.SimpleNamespace(accept_waveform=lambda rate, samples: None,
-                                         result=types.SimpleNamespace(text=""))
+    class WhisperModel:
+        def __init__(self, *args, **kwargs):
+            pass
 
-        def decode_stream(self, stream):
-            stream.result.text = heard[tried[-1]]
+        def transcribe(self, path, **kwargs):
+            return iter([types.SimpleNamespace(text=heard[tried[-1]])]), None
 
-    fake.OfflineTtsConfig = fake.OfflineTtsModelConfig = fake.OfflineTtsMatchaModelConfig = Config
-    fake.OfflineTts, fake.OfflineRecognizer = Tts, Recognizer
-    monkeypatch.setitem(sys.modules, "sherpa_onnx", fake)
+    fake_whisper.WhisperModel = WhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_whisper)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    settings_path = tmp_path / ".medcare_reachy" / "settings.json"
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps({"elevenlabs_api_key": "test-key", "elevenlabs_voice_id": "voice"}),
+                             encoding="utf-8")
     job_path = tmp_path / "job.json"
-    job_path.write_text(json.dumps({"rendered": {"thanks": "謝謝您！"}, "clips": job_clips}, ensure_ascii=False),
+    job_path.write_text(json.dumps({"rendered": {"thanks": "????????????"}, "clips": job_clips}, ensure_ascii=False),
                         encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["render", str(job_path)])
     printed = io.StringIO()
     monkeypatch.setattr(sys, "stdout", printed)
     exec(compile(deploy.RENDER, "render_clips.py", "exec"), {"__name__": "__main__"})
     return printed.getvalue(), tmp_path / ".medcare_reachy" / "clips" / "zh-TW", tried
-
 
 def test_the_render_script_keeps_only_acknowledgements_whose_echo_the_app_recognises(tmp_path, monkeypatch):
     manifest = load_manifest()

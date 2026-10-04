@@ -60,7 +60,7 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
     # A check-in turn Reachy answered with its 「嗯」 is followed, once handed over, by a thinking phrase.
     voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud)
     voice.start()
-    speaker = Speaker(robot)
+    speaker = Speaker(robot, settings.get("elevenlabs_api_key", ""), settings.get("elevenlabs_voice_id"))
     speaker.preload()
     try:
         async with AppClient(settings["app_url"], settings["device_token"]) as app:

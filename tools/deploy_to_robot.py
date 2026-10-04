@@ -8,10 +8,10 @@ space's version back. The installed package is backed up first (~/.medcare_reach
 The SSH password comes from REACHY_SSH_PASSWORD, or is asked for.
 
 Voice clips: every zh-TW clip whose WAV is missing on the robot, or was rendered from other words than the
-manifest has now, is rendered again with Matcha-TTS on the robot (~/.medcare_reachy/clips/zh-TW/rendered.json
+manifest has now, is rendered again with ElevenLabs on the robot (~/.medcare_reachy/clips/zh-TW/rendered.json
 records what each WAV says). The deploy stops when a planned clip was not written, and when any manifest clip has no
-WAV on the robot afterwards; a clip Whisper Base does not hear exactly as written is kept with a warning to listen to
-it. The check-in's 「嗯」 (ack) and thinking phrases (manifest "variants") are kept only when Whisper Base hears them as
+WAV on the robot afterwards; a clip Whisper does not hear exactly as written is kept with a warning to listen to
+it. The check-in's 「嗯」 (ack) and thinking phrases (manifest "variants") are kept only when Whisper hears them as
 words the app recognises as its own echo; otherwise they are not written and the deploy fails.
 
 Camera: Reachy Mini's daemon (reachy_mini 1.11) shares the camera with apps at IPC_FPS = 10 frames per second,
@@ -40,7 +40,7 @@ RENDERED = "rendered.json"
 DAEMON_MEDIA_SERVER = "/venvs/mini_daemon/lib/python3.12/site-packages/reachy_mini/media/media_server.py"
 CAMERA_FPS_NEEDED = 15
 
-# The Matcha zh-baker voice reads Simplified Chinese. For each zh-TW clip: the manifest text it was written for,
+# ElevenLabs reads the Simplified Chinese words listed for each zh-TW clip; this table stores both versions,
 # and the words the voice is given. tests/test_deploy_tool.py fails when the manifest changes without this table.
 SPOKEN = {
     "wake_greeting": ("您好！吃藥的時間到了。", "您好！吃药的时间到了。"),
@@ -66,14 +66,14 @@ SPOKEN = {
     "thinking_2": ("讓我想一想喔。", "让我想一想哦。"),
     "thinking_3": ("我想想看喔。", "我想想看哦。"),
 }
-# Speeds a clip is rendered at, best first (the first Whisper Base hears word for word is kept). Prompts are slow for
+# Speeds a clip is rendered at, best first (the first Whisper hears word for word is kept). Prompts are slow for
 # older listeners; the thinking phrases carry no information and are said at the voice's own pace (about 1.1-1.3 s on
 # the laptop with the robot's model files; at 0.85 they take 1.4-1.5 s).
 DEFAULT_SPEEDS = (0.85, 0.8, 0.9)
 RENDER_SPEEDS = {"thinking_1": (1.0, 1.1, 0.9), "thinking_2": (1.0, 1.1, 0.9), "thinking_3": (1.0, 1.1, 0.9)}
 
 # Runs on the robot, after the upload: renders the clips listed in the job file, checks each by reading it back with
-# Whisper Base (a few speeds; the best match is kept), and records what every WAV says. A check-in acknowledgement
+# Whisper (a few speeds; the best match is kept), and records what every WAV says. A check-in acknowledgement
 # ("filler") is kept only as heard so that the app recognises its echo (voice.without_filler of the package just
 # uploaded); when no speed gives that, it is not written ("unrecognised"), so it is never played and the deploy fails.
 RENDER = r'''
@@ -87,7 +87,6 @@ from pathlib import Path
 import numpy as np
 
 M = Path.home() / ".medcare_reachy" / "models"
-T = M / "tts" / "matcha-icefall-zh-baker"
 OUT = Path.home() / ".medcare_reachy" / "clips" / "zh-TW"
 STAMP = OUT / "rendered.json"
 
@@ -103,64 +102,76 @@ def save_stamp():
 
 
 if job["clips"]:
-    import sherpa_onnx
+    voice_id = job.get("voice_id", "JBFqnCBsd6RMkjVDRZzb")
+    render_complete = True
+    import httpx
+    from faster_whisper import WhisperModel
+
+    settings = json.loads((Path.home() / ".medcare_reachy" / "settings.json").read_text(encoding="utf-8"))
+    api_key = settings.get("elevenlabs_api_key", "").strip()
+    voice_id = settings.get("elevenlabs_voice_id", "JBFqnCBsd6RMkjVDRZzb").strip()
+    if not api_key:
+        raise SystemExit("ElevenLabs API key is missing; enter it on the robot settings page first")
 
     if any(clip.get("filler") for clip in job["clips"]):
         from medcare_reachy.bridge.voice import without_filler
 
-    fsts = ",".join(str(T / f) for f in ("phone.fst", "date.fst", "number.fst") if (T / f).is_file())
-    tts = sherpa_onnx.OfflineTts(sherpa_onnx.OfflineTtsConfig(
-        model=sherpa_onnx.OfflineTtsModelConfig(matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-            acoustic_model=str(T / "model-steps-3.onnx"), vocoder=str(M / "tts" / "vocos-22khz-univ.onnx"),
-            lexicon=str(T / "lexicon.txt"), tokens=str(T / "tokens.txt")), num_threads=2),
-        rule_fsts=fsts, max_num_sentences=1))
-    from faster_whisper import WhisperModel
-
     asr = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2,
                        download_root=str(M / "stt" / "whisper"))
-    for clip in job["clips"]:
-        want = "".join(ch for ch in clip["text"] if ch.isalnum())
-        best = None
-        for speed in clip.get("speeds") or (0.85, 0.8, 0.9):
-            audio = tts.generate(clip["text"], sid=0, speed=speed)
-            samples = np.asarray(audio.samples, dtype=np.float32)
-            verify_wav = OUT / ".verify.wav"
-            with wave.open(str(verify_wav), "wb") as w:
+    with httpx.Client(timeout=45.0) as client:
+        for clip in job["clips"]:
+            want = "".join(ch for ch in clip["text"] if ch.isalnum())
+            best = None
+            for speed in clip.get("speeds") or (0.85, 0.8, 0.9):
+                response = client.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=pcm_22050",
+                    headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+                    json={"text": clip["text"], "model_id": "eleven_flash_v2_5", "language_code": "zh",
+                          "voice_settings": {"speed": speed}},
+                )
+                if response.status_code != 200:
+                    raise SystemExit(f"ElevenLabs speech request failed (HTTP {response.status_code})")
+                samples = np.frombuffer(response.content, dtype="<i2").astype(np.float32) / 32768.0
+                verify_wav = OUT / ".verify.wav"
+                with wave.open(str(verify_wav), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(22050)
+                    w.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+                pieces, _ = asr.transcribe(str(verify_wav), language="zh", beam_size=1,
+                                           condition_on_previous_text=False)
+                heard = "".join(piece.text for piece in pieces).strip()
+                verify_wav.unlink(missing_ok=True)
+                got = "".join(ch for ch in heard if ch.isalnum())
+                usable = not clip.get("filler") or without_filler(heard) == ""
+                print(f"render {clip['id']} speed={speed} heard={heard!r} ok={got == want}"
+                      + ("" if usable else " echo-not-recognised"))
+                score = difflib.SequenceMatcher(None, got, want).ratio()
+                if usable and (best is None or score > best[0]):
+                    best = (score, samples, 22050)
+                if usable and got == want:
+                    break
+            if best is None:
+                print("unrecognised", clip["id"])
+                render_complete = False
+                continue
+            score, samples, rate = best
+            loud = np.flatnonzero(np.abs(samples) > 0.003)
+            if len(loud):
+                samples = samples[max(0, loud[0] - rate // 100):]
+            tmp = OUT / f".{clip['id']}.wav.tmp"
+            with wave.open(str(tmp), "wb") as w:
                 w.setnchannels(1)
                 w.setsampwidth(2)
-                w.setframerate(audio.sample_rate)
+                w.setframerate(rate)
                 w.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
-            pieces, _ = asr.transcribe(str(verify_wav), language="zh", beam_size=1,
-                                       condition_on_previous_text=False)
-            heard = "".join(piece.text for piece in pieces).strip()
-            verify_wav.unlink(missing_ok=True)
-            got = "".join(ch for ch in heard if ch.isalnum())
-            usable = not clip.get("filler") or without_filler(heard) == ""
-            print(f"render {clip['id']} speed={speed} heard={heard!r} ok={got == want}"
-                  + ("" if usable else " echo-not-recognised"))
-            score = difflib.SequenceMatcher(None, got, want).ratio()
-            if usable and (best is None or score > best[0]):
-                best = (score, samples, audio.sample_rate)
-            if usable and got == want:
-                break
-        if best is None:
-            print("unrecognised", clip["id"])
-            continue
-        score, samples, rate = best
-        # Matcha starts with ~70 ms of near-silence (the 「嗯」 must come as soon as possible): keep 10 ms of it.
-        loud = np.flatnonzero(np.abs(samples) > 0.003)   # ~-50 dBFS
-        if len(loud):
-            samples = samples[max(0, loud[0] - rate // 100):]
-        tmp = OUT / f".{clip['id']}.wav.tmp"
-        with wave.open(str(tmp), "wb") as w:
-            w.setnchannels(1)
-            w.setsampwidth(2)
-            w.setframerate(rate)
-            w.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
-        os.replace(tmp, OUT / f"{clip['id']}.wav")
-        rendered[clip["id"]] = clip["written_for"]
-        save_stamp()
-        print("wrote", clip["id"], "heard-ok" if score == 1.0 else "not-heard-as-written")
+            os.replace(tmp, OUT / f"{clip['id']}.wav")
+            rendered[clip["id"]] = clip["written_for"]
+            save_stamp()
+            print("wrote", clip["id"], "heard-ok" if score == 1.0 else "not-heard-as-written")
+if job["clips"] and render_complete:
+    rendered["_tts_engine"] = "elevenlabs"
+    rendered["_voice_id"] = voice_id
 save_stamp()
 '''
 
@@ -185,7 +196,8 @@ def render_job_clip(clip_id: str, manifest: dict) -> dict:
             "speeds": list(RENDER_SPEEDS.get(clip_id, DEFAULT_SPEEDS)), "filler": clip_id in fillers(manifest)}
 
 
-def plan_clips(manifest: dict, rendered: dict | None, installed: dict | None, on_robot: set) -> tuple[dict, list]:
+def plan_clips(manifest: dict, rendered: dict | None, installed: dict | None, on_robot: set,
+               voice_id: str | None = None) -> tuple[dict, list]:
     """What each WAV on the robot says now, and the clips to render: missing, or made from other words.
 
     `rendered` is the robot's record of what each WAV says. Robots set up before that record existed have WAVs
@@ -194,8 +206,12 @@ def plan_clips(manifest: dict, rendered: dict | None, installed: dict | None, on
     if rendered is None:
         rendered = {clip_id: entry["zh-TW"] for clip_id, entry in (installed or {}).get("clips", {}).items()
                     if clip_id in on_robot}
+    # Migrate old Matcha WAVs on the first deploy after the ElevenLabs backend switch.
+    current_engine = (rendered or {}).get("_tts_engine") == "elevenlabs"
+    current_voice = voice_id is None or (rendered or {}).get("_voice_id") == voice_id
     stale = [clip_id for clip_id, entry in manifest["clips"].items()
-             if clip_id not in on_robot or rendered.get(clip_id) != entry["zh-TW"]]
+             if not current_engine or not current_voice or clip_id not in on_robot
+             or rendered.get(clip_id) != entry["zh-TW"]]
     return rendered, stale
 
 
@@ -208,9 +224,12 @@ def prepare_clips(sftp, manifest: dict) -> dict:
     """
     record_path = posixpath.join(CLIPS_DIR, RENDERED)
     record = read_json(sftp, record_path)
+    settings = read_json(sftp, ".medcare_reachy/settings.json") or {}
+    voice_id = settings.get("elevenlabs_voice_id", "JBFqnCBsd6RMkjVDRZzb")
     rendered, stale = plan_clips(manifest, record, read_json(sftp, f"{REMOTE_PKG}/bridge/clips/manifest.json"),
-                                 wav_clips(sftp))
-    job = {"rendered": rendered, "clips": [render_job_clip(clip_id, manifest) for clip_id in stale]}
+                                 wav_clips(sftp), voice_id=voice_id)
+    job = {"rendered": rendered, "voice_id": voice_id,
+           "clips": [render_job_clip(clip_id, manifest) for clip_id in stale]}
     if record is None and rendered:   # WAVs exist, so their folder does
         temporary = posixpath.join(CLIPS_DIR, f".{RENDERED}.tmp")
         with sftp.file(temporary, "w") as handle:
@@ -220,7 +239,7 @@ def prepare_clips(sftp, manifest: dict) -> dict:
 
 
 def render_problems(output: str, job: dict) -> tuple[list, list]:
-    """From the render script's output: the clips it did not write, and those Whisper Base heard otherwise."""
+    """From the render script's output: the clips it did not write, and those Whisper heard otherwise."""
     wrote = {}
     for line in output.splitlines():
         parts = line.split()
@@ -344,14 +363,17 @@ def main() -> int:
         run(client, f"find {REMOTE_PKG} -name __pycache__ -type d -prune -exec rm -rf {{}} +")
         run(client, f"C={REMOTE_PKG}/bridge/clips; [ -e $C/zh-TW ] || ln -s ~/.medcare_reachy/clips/zh-TW $C/zh-TW")
 
+        run(client, f"{PYTHON} -m pip install 'faster-whisper>=1.1,<2'", timeout=900)
+        print("faster-whisper installed")
+
         run(client, f"mkdir -p ~/.medcare_reachy/models/stt && cd ~/.medcare_reachy/models/stt && "
                     f"([ -s silero_vad.onnx ] || curl -sSL -o silero_vad.onnx {VAD_URL}) && ls -la silero_vad.onnx")
         print("voice activity model ready")
-        run(client, f"{PYTHON} -m pip install 'faster-whisper>=1.1,<2'", timeout=900)
+
         run(client, f"{PYTHON} -c 'from pathlib import Path; from faster_whisper import WhisperModel; "
-                    f"WhisperModel(\"base\", device=\"cpu\", compute_type=\"int8\", cpu_threads=2, "
-                    f"download_root=str(Path.home() / \".medcare_reachy/models/stt/whisper\"))'", timeout=900)
-        print("Whisper Base model ready")
+                    "WhisperModel(\"base\", device=\"cpu\", compute_type=\"int8\", cpu_threads=2, "
+                    "download_root=str(Path.home() / \".medcare_reachy/models/stt/whisper\"))'", timeout=900)
+        print("Whisper Base downloaded from Hugging Face")
 
         print("clips to render:", ", ".join(stale) or "none")
         sftp = client.open_sftp()
@@ -371,13 +393,13 @@ def main() -> int:
             print(f"rendering the clips failed ({', '.join(missing) or 'see above'} not written): those keep their "
                   "old WAVs, and the next deploy renders them again")
             if unrecognised(output):
-                print(f"ERROR clips: {', '.join(unrecognised(output))} came back from Whisper Base as words the app "
+                print(f"ERROR clips: {', '.join(unrecognised(output))} came back from Whisper as words the app "
                       "would not recognise as Reachy's own echo (voice.without_filler), so they were not written and "
-                      "are never played. Add what Whisper Base heard (above) to THINKING_PHRASES/_SOUND_ALIKES in "
+                      "are never played. Add what Whisper heard (above) to THINKING_PHRASES/_SOUND_ALIKES in "
                       "voice.py, or change the phrase.")
             return 1
         if misheard:
-            print(f"WARNING clips: Whisper Base did not hear {', '.join(misheard)} exactly as written (the closest of "
+            print(f"WARNING clips: Whisper did not hear {', '.join(misheard)} exactly as written (the closest of "
                   "three speeds was kept). Listen to them on the robot before relying on them.")
         sftp = client.open_sftp()
         try:

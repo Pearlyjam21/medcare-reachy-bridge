@@ -1,7 +1,7 @@
-"""Reachy's voice for text that isn't a prerecorded clip (check-in replies), with Matcha-TTS on the robot.
+"""Reachy's voice for text that isn't a prerecorded clip, using ElevenLabs.
 
 The server sends replies already converted for this voice (`speech_text`, Simplified characters for the Mandarin
-zh-baker voice). Audio is synthesised into a temporary WAV, played, and deleted.
+voice). Audio is synthesised into a temporary WAV, played, and deleted.
 """
 
 import logging
@@ -13,33 +13,41 @@ import threading
 import time
 import wave
 from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
 
 import numpy as np
 
 log = logging.getLogger(__name__)
 
-TTS_DIR = Path.home() / ".medcare_reachy" / "models" / "tts"
-MATCHA = "matcha-icefall-zh-baker"
-TTS_FILES = (f"{MATCHA}/model-steps-3.onnx", f"{MATCHA}/lexicon.txt", f"{MATCHA}/tokens.txt", "vocos-22khz-univ.onnx")
 SPEED = 0.85   # a little slower than default for older listeners
+SAMPLE_RATE = 22050
+MODEL_ID = "eleven_flash_v2_5"
+DEFAULT_VOICE_ID = "JBFqnCBsd6RMkjVDRZzb"
+API_URL = "https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=pcm_22050"
 
-_engine = None
-_engine_lock = threading.Lock()
 
+class ElevenLabsTTS:
+    """Small synchronous client; synthesis runs on the speaker's producer thread."""
 
-def _matcha(models_dir: Path):
-    import sherpa_onnx
+    def __init__(self, api_key: str, voice_id: str, client=None):
+        self.api_key = api_key
+        self.voice_id = voice_id
+        self.client = client or httpx.Client(timeout=30.0)
 
-    matcha = models_dir / MATCHA
-    fsts = ",".join(str(matcha / f) for f in ("phone.fst", "date.fst", "number.fst") if (matcha / f).is_file())
-    config = sherpa_onnx.OfflineTtsConfig(
-        model=sherpa_onnx.OfflineTtsModelConfig(
-            matcha=sherpa_onnx.OfflineTtsMatchaModelConfig(
-                acoustic_model=str(matcha / "model-steps-3.onnx"), vocoder=str(models_dir / "vocos-22khz-univ.onnx"),
-                lexicon=str(matcha / "lexicon.txt"), tokens=str(matcha / "tokens.txt")),
-            num_threads=2),
-        rule_fsts=fsts, max_num_sentences=2)
-    return sherpa_onnx.OfflineTts(config)
+    def generate(self, text: str, sid: int = 0, speed: float = SPEED):
+        response = self.client.post(
+            API_URL.format(voice_id=self.voice_id),
+            headers={"xi-api-key": self.api_key, "Content-Type": "application/json"},
+            json={"text": text, "model_id": MODEL_ID, "language_code": "zh",
+                  "voice_settings": {"speed": speed}},
+        )
+        if response.status_code != 200:
+            # Do not include response bodies: provider errors may contain submitted text.
+            raise RuntimeError(f"ElevenLabs speech request failed (HTTP {response.status_code})")
+        samples = np.frombuffer(response.content, dtype="<i2").astype(np.float32) / 32768.0
+        return SimpleNamespace(samples=samples, sample_rate=SAMPLE_RATE)
 
 
 MAX_CHUNK = 16       # comma clauses are joined up to this many characters, so the first chunk is ready in ~2 s
@@ -116,19 +124,21 @@ def _ms(seconds: float) -> int:
 
 
 class Speaker:
-    def __init__(self, robot, models_dir: Path = TTS_DIR, *, load=_matcha, clock=time.monotonic):
-        self.robot, self.models_dir, self._load, self.clock = robot, Path(models_dir), load, clock
-        missing = [name for name in TTS_FILES if not (self.models_dir / name).is_file()]
-        self.available = not missing
-        if missing:
-            log.warning("check-in voice is off: missing %s in %s", ", ".join(missing), self.models_dir)
+    def __init__(self, robot, api_key: str = "", voice_id: str = DEFAULT_VOICE_ID, *, load=None,
+                 clock=time.monotonic):
+        self.robot, self.clock = robot, clock
+        self._load = load or (lambda: ElevenLabsTTS(api_key, voice_id))
+        self._engine = None
+        self._engine_lock = threading.Lock()
+        self.available = bool(api_key)
+        if not self.available:
+            log.warning("check-in voice is off: ElevenLabs API key is not configured")
 
     def _tts(self):
-        global _engine
-        with _engine_lock:   # one engine per process (~12 s to load on the Pi); reused across bridge restarts
-            if _engine is None:
-                _engine = self._load(self.models_dir)
-            return _engine
+        with self._engine_lock:
+            if self._engine is None:
+                self._engine = self._load()
+            return self._engine
 
     def preload(self) -> None:
         """Load the voice in the background so the first reply isn't delayed."""

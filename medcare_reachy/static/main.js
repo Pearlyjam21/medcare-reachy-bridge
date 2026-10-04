@@ -50,11 +50,15 @@ async function loadConfig() {
   form.app_url.value = config.app_url || "";
   form.language.value = config.language;
   form.capture_fps.value = config.capture_fps;
+  form.elevenlabs_voice_id.value = config.elevenlabs_voice_id;
   form.checkin_ack.checked = config.checkin_ack !== false;
   form.checkin_gestures.checked = config.checkin_gestures !== false;
   document.getElementById("token-hint").textContent = config.device_token_set
     ? "A robot key is saved. Leave empty to keep it, or paste a new one."
     : "Shown once when you pair the robot in the web app.";
+  document.getElementById("elevenlabs-key-hint").textContent = config.elevenlabs_api_key_set
+    ? "An API key is saved privately on this robot. Leave empty to keep it, or paste a replacement."
+    : "Required for spoken replies. Stored privately on this robot; never shown again.";
 }
 
 form.addEventListener("submit", async (event) => {
@@ -63,6 +67,8 @@ form.addEventListener("submit", async (event) => {
   const body = {
     app_url: form.app_url.value.trim(),
     device_token: form.device_token.value.trim(),
+    elevenlabs_api_key: form.elevenlabs_api_key.value.trim(),
+    elevenlabs_voice_id: form.elevenlabs_voice_id.value.trim(),
     language: form.language.value,
     capture_fps: Number(form.capture_fps.value),
     checkin_ack: form.checkin_ack.checked,
@@ -79,6 +85,7 @@ form.addEventListener("submit", async (event) => {
     return;
   }
   form.device_token.value = "";
+  form.elevenlabs_api_key.value = "";
   show(data.status);
   await loadConfig();
 });
