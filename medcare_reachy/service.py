@@ -15,6 +15,15 @@ from medcare_reachy.settings_store import SettingsStore
 
 log = logging.getLogger("medcare_reachy")
 CLIPS_DIR = Path(__file__).resolve().parent / "bridge" / "clips"
+
+
+def _clips_root_dir(language: str) -> Path:
+    """Use rendered robot-storage clips when present, so reinstalling the package keeps its voice clips."""
+    persistent = Path.home() / ".medcare_reachy" / "clips"
+    language_dir = persistent / language
+    if language_dir.is_dir() and any(language_dir.glob("*.wav")):
+        return persistent
+    return CLIPS_DIR
 STEP_TEXT = {
     "WAKE": "Waking up for a medication reminder.",
     "ANNOUNCE": "Announcing the medication reminder.",
@@ -46,7 +55,7 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
         engine = await asyncio.to_thread(VisionEngine, models_dir)
         emotion = await asyncio.to_thread(EmotionEngine, models_dir / models.EMOTION_MODEL)
     robot = ReachyRobot.attach(reachy_mini)
-    clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
+    clips = ClipPlayer(robot, _clips_root_dir(settings["language"]), settings["language"])
     clips.audit()
     # A check-in turn Reachy answered with its 「嗯」 is followed, once handed over, by a thinking phrase.
     voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud)
