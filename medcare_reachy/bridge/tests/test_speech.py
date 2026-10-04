@@ -105,12 +105,8 @@ class SlowTTS:
 
 
 def test_say_plays_every_chunk_in_order_while_synthesising_ahead(tmp_path, monkeypatch):
-    for name in speech.TTS_FILES:
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_bytes(b"x")
     tts, robot = SlowTTS(), Robot()
-    monkeypatch.setattr(speech, "_engine", None)
-    speaker = Speaker(robot, tmp_path, load=lambda models_dir: tts)
+    speaker = Speaker(robot, "test-key", load=lambda: tts)
     assert speaker.say("第一句。第二句。第三句。") is True
     assert [text for _, text in tts.started] == ["第一句。", "第二句。", "第三句。"]
     assert len(robot.played) == 3 and all(head == b"RIFF" for _, head in robot.played)
@@ -119,21 +115,14 @@ def test_say_plays_every_chunk_in_order_while_synthesising_ahead(tmp_path, monke
 
 
 def test_a_long_reply_with_commas_starts_playback_before_all_chunks_are_synthesised(tmp_path, monkeypatch):
-    for name in speech.TTS_FILES:
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_bytes(b"x")
     tts, robot = SlowTTS(), Robot()
-    monkeypatch.setattr(speech, "_engine", None)
     text = "那走太久膝蓋會累，現在有沒有好一點，如果痛得比較久，可以問問醫生或藥師。"
-    assert Speaker(robot, tmp_path, load=lambda models_dir: tts).say(text) is True
+    assert Speaker(robot, "test-key", load=lambda: tts).say(text) is True
     assert "".join(piece for _, piece in tts.started) == text
     assert len(tts.started) > 2 and robot.played[0][0] < tts.started[-1][0]
 
 
 def test_natural_first_clause_reduces_first_audio_wait_without_losing_text(tmp_path, monkeypatch):
-    for name in speech.TTS_FILES:
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_bytes(b"x")
 
     class LengthTTS(SlowTTS):
         def generate(self, text, sid, speed):
@@ -142,27 +131,22 @@ def test_natural_first_clause_reduces_first_audio_wait_without_losing_text(tmp_p
             return types.SimpleNamespace(samples=np.zeros(100, np.float32), sample_rate=16000)
 
     tts, robot = LengthTTS(), Robot()
-    monkeypatch.setattr(speech, "_engine", None)
     text = "今天天氣真好，出門散步看看。"
     stats = {}
-    assert Speaker(robot, tmp_path, load=lambda models_dir: tts).say(text, stats) is True
+    assert Speaker(robot, "test-key", load=lambda: tts).say(text, stats) is True
     assert "".join(piece for _, piece in tts.started) == text
     assert stats["tts_first_audio_ms"] < 350
     assert stats["tts_chunks"] == 2
 
 
 def test_say_without_models_or_text_says_nothing(tmp_path):
-    speaker = Speaker(Robot(), tmp_path)
+    speaker = Speaker(Robot())
     assert speaker.available is False and speaker.say("你好") is False
 
 
 def test_say_reports_its_timings(tmp_path, monkeypatch):
-    for name in speech.TTS_FILES:
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_bytes(b"x")
     tts, robot = SlowTTS(), Robot()
-    monkeypatch.setattr(speech, "_engine", None)
-    speaker = Speaker(robot, tmp_path, load=lambda models_dir: tts)
+    speaker = Speaker(robot, "test-key", load=lambda: tts)
     stats = {}
     assert speaker.say("第一句。第二句。第三句。", stats) is True
     assert set(stats) == {"tts_first_audio_ms", "tts_total_ms", "tts_chunks", "tts_synth_ms"}
@@ -175,13 +159,9 @@ def test_say_reports_its_timings(tmp_path, monkeypatch):
 
 def test_say_tells_when_its_first_sound_is_about_to_play(tmp_path, monkeypatch):
     """The check-in switches Reachy from thinking to speaking at its first sound, not when synthesis starts."""
-    for name in speech.TTS_FILES:
-        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_bytes(b"x")
     tts, robot = SlowTTS(), Robot()
-    monkeypatch.setattr(speech, "_engine", None)
     cues = []
-    assert Speaker(robot, tmp_path, load=lambda models_dir: tts).say(
+    assert Speaker(robot, "test-key", load=lambda: tts).say(
         "第一句。第二句。", on_audio=lambda: cues.append((time.monotonic(), len(robot.played)))) is True
     assert len(cues) == 1 and cues[0][1] == 0                             # once, before anything played
     assert tts.started[0][0] + 0.05 <= cues[0][0] <= robot.played[0][0]   # after the first chunk's synthesis
@@ -189,4 +169,4 @@ def test_say_tells_when_its_first_sound_is_about_to_play(tmp_path, monkeypatch):
 
 def test_say_with_nothing_to_say_reports_nothing(tmp_path):
     stats = {}
-    assert Speaker(Robot(), tmp_path).say("你好", stats) is False and stats == {}
+    assert Speaker(Robot()).say("你好", stats) is False and stats == {}
