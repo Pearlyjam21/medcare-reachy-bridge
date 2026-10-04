@@ -34,6 +34,11 @@ Anything it can't verify goes to a family member to confirm on LINE.
 The vision and emotion models ship inside the app (about 55 MB) and are checked against pinned SHA-256s at every start; nothing
 is downloaded at run time.
 
+## Speech and conversation models
+
+- **Speech-to-text:** Whisper Base via faster-whisper runs locally on Reachy Mini (CPU, int8). The deployment helper downloads the model to `~/.medcare_reachy/models/stt/whisper`; Silero VAD detects speech boundaries. Only the transcript is sent to MedAiCarePlus, never microphone audio.
+- **Conversation:** the paired MedAiCarePlus server sends transcript text to OpenRouter. Its primary model is Google Gemini 2.5 Flash Lite, with Google Gemini 2.5 Flash as fallback. The model/API configuration lives in the server repository, not in this Space app.
+
 ## What it does and doesn't do
 
 - Reminds, finds the patient, prompts each medicine, and watches for hand-to-mouth movement. **It cannot identify
@@ -43,7 +48,7 @@ is downloaded at run time.
   the day's maximum reached, or missed too long ago), the robot says the server's one-sentence reason once and moves
   on to the next medicine. It never retries that dose in the same reminder.
 - Fails safe: stops and puts the robot to sleep if the server is unreachable or the robot key is revoked.
-- No microphone in this version.
+- With the patient's microphone consent, the robot uses Silero VAD and Whisper Base via faster-whisper on the robot to recognize a completed-dose claim and transcribe check-in speech. Raw audio stays on the robot; only the transcript is sent to the server.
 - **Not a medical device.** Prototype software. Prompt wording is pending clinician review, and no voice clips are
   included yet, so the robot is silent until they're added.
 

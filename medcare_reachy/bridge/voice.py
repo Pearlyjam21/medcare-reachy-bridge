@@ -2,7 +2,7 @@
 
 The slot session turns listening on only while a dose is watched (robot_microphone consent) or during a check-in
 conversation (all check-in consents), and mutes it while the robot speaks. Audio stays in memory: silero VAD cuts
-speech segments and SenseVoice-Small turns each into text. In "done" mode only whether a "finished" phrase was heard
+speech segments and Whisper Base turns each into text. In "done" mode only whether a "finished" phrase was heard
 leaves this module; in "chat" mode the transcript is handed to the session, which sends that text (never audio) to
 the server. Nothing is stored or logged here.
 
@@ -12,7 +12,7 @@ The session learns that the patient paused as soon as the VAD releases their wor
 are decoded, so Reachy can answer at once with a 「嗯」 (`note_ack()`). Once the words it answered are handed over,
 Reachy says it is thinking about them (「我再想一下喔。」, `think_aloud`, `note_filler()`): only then, so a patient
 going on after their pause is never talked over within one turn (their words and Reachy's echo mixed in one segment
-came out of SenseVoice garbled, losing 「活」 of 「我不想…活了」), and a cough that decodes to nothing gets no promise of
+came out of Whisper Base garbled, losing 「活」 of 「我不想…活了」), and a cough that decodes to nothing gets no promise of
 an answer. The microphone stays on meanwhile, and nothing it hears is ever silenced: should the 「嗯」 or the phrase
 come back through it, it is recognised by its words and dropped.
 """
@@ -33,7 +33,7 @@ from medcare_reachy.bridge.media import resample
 log = logging.getLogger(__name__)
 
 STT_DIR = Path.home() / ".medcare_reachy" / "models" / "stt"
-STT_FILES = ("model.int8.onnx", "tokens.txt", "silero_vad.onnx")
+STT_FILES = ("silero_vad.onnx",)
 SAMPLE_RATE = 16000
 VAD_WINDOW = 512                 # silero VAD's window at 16 kHz
 MIN_SILENCE_SECONDS = 0.5        # VAD: a pause this long ends a speech segment
@@ -49,12 +49,12 @@ ACK_ECHO_SECONDS = 0.5
 # while Reachy's 「嗯」 may still be echoing, or being decoded, is waited for (its words decide) up to THINK_WAIT_SECONDS.
 THINK_AFTER_SECONDS = 0.5
 THINK_WAIT_SECONDS = 2.0
-# How SenseVoice writes a 「嗯」 or a filler like it, at the start of a transcript. Characters that also begin
+# How Whisper Base writes a 「嗯」 or a filler like it, at the start of a transcript. Characters that also begin
 # words (恩人, 额头, 唔係, 哼歌) count only on their own.
 ACK_LEAD = re.compile(r"^(?:[\W_]*(?:[嗯呃]+|[恩额唔哼]+(?![^\W_])|m+-?h?m+(?![a-z])|hm+(?![a-z])))+[\W_]*",
                       re.IGNORECASE)
 # Reachy's thinking phrases (clips/manifest.json "variants" > "thinking": 「我再想一下喔。」「讓我想一想喔。」
-# 「我想想看喔。」) in the Simplified words SenseVoice writes back. Rendered with the robot's voice and played through
+# 「我想想看喔。」) in the Simplified words Whisper Base writes back. Rendered with the robot's voice and played through
 # a simulated speaker and room, it wrote them word for word, or without the closing 哦; with the echo's start or end
 # lost, the rest of the phrase (THINKING_FORMS); also 在 for 再 and 喔 for 哦, and with the patient talking at the
 # same time 叫 for 让 and 享/响 for 想 (_SOUND_ALIKES).
@@ -100,7 +100,7 @@ LANGUAGE_CODES = {"zh-TW": "zh", "en": "en"}
 # came in every slot state, mostly with the listener off, so they have another cause (runner.py logs them).
 VOICE_NICE = 5
 
-# Substrings of what SenseVoice writes (Simplified or Traditional Chinese, or English) when someone says they
+# Substrings of what Whisper Base writes (Simplified or Traditional Chinese, or English) when someone says they
 # have taken it. Any negation voids the match: "還沒吃完" is not "吃完".
 DONE_WORDS = ("吃完", "吃好", "吃了", "吃过", "吃過", "吞了", "吞下", "服用了", "好了", "完成",
               "finished", "done", "took it", "taken")
@@ -148,7 +148,7 @@ class _Heard(NamedTuple):
     speech: float      # seconds of voiced audio
     ended: float       # when the patient stopped speaking
     released: float    # when the VAD released the segment
-    decode: float      # seconds SenseVoice took
+    decode: float      # seconds Whisper Base took
 
 
 class _MicClock:
@@ -205,27 +205,22 @@ def to_mono_16k(samples, rate: int) -> np.ndarray:
     return resample(samples, rate, SAMPLE_RATE)
 
 
-_recognizers: dict = {}
-_recognizers_lock = threading.Lock()
+_whisper_models: dict = {}
+_whisper_models_lock = threading.Lock()
 
 
-def _recognizer(models_dir: Path, language: str):
-    """SenseVoice takes ~10 s to load on the Pi; keep one per process so a bridge restart reuses it."""
+def _speech_models(models_dir: Path, language: str):
     import sherpa_onnx
+    from faster_whisper import WhisperModel
 
-    key = (str(models_dir), language)
-    with _recognizers_lock:
-        if key not in _recognizers:
-            _recognizers[key] = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-                model=str(models_dir / "model.int8.onnx"), tokens=str(models_dir / "tokens.txt"),
-                language=LANGUAGE_CODES.get(language, "auto"), use_itn=True, num_threads=2)
-        return _recognizers[key]
+    key = str(models_dir)
+    with _whisper_models_lock:
+        if key not in _whisper_models:
+            _whisper_models[key] = WhisperModel(
+                "base", device="cpu", compute_type="int8", cpu_threads=2,
+                download_root=str(models_dir / "whisper"))
+        recognizer = _whisper_models[key]
 
-
-def _sherpa_models(models_dir: Path, language: str):
-    import sherpa_onnx
-
-    recognizer = _recognizer(models_dir, language)
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(models_dir / "silero_vad.onnx")
     config.silero_vad.min_silence_duration = MIN_SILENCE_SECONDS
@@ -235,13 +230,12 @@ def _sherpa_models(models_dir: Path, language: str):
     vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=30)
 
     def transcribe(segment: np.ndarray) -> str:
-        stream = recognizer.create_stream()
-        stream.accept_waveform(SAMPLE_RATE, segment)
-        recognizer.decode_stream(stream)
-        return stream.result.text
+        chunks, _ = recognizer.transcribe(
+            segment, language=LANGUAGE_CODES.get(language, "zh"), beam_size=1,
+            condition_on_previous_text=False, vad_filter=False)
+        return "".join(chunk.text for chunk in chunks).strip()
 
     return vad, transcribe
-
 
 class DoneListener:
     """Background thread pulling the robot's microphone.
@@ -258,7 +252,7 @@ class DoneListener:
     """
 
     def __init__(self, robot, language: str = "zh-TW", models_dir: Path = STT_DIR, *, clock=time.monotonic,
-                 load=_sherpa_models, think_aloud=None, spawn=_in_thread):
+                 load=_speech_models, think_aloud=None, spawn=_in_thread):
         self.robot, self.language, self.models_dir = robot, language, Path(models_dir)
         self.clock, self._load = clock, load
         self.think_aloud, self._spawn = think_aloud, spawn

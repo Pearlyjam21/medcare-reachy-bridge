@@ -10,8 +10,8 @@ The SSH password comes from REACHY_SSH_PASSWORD, or is asked for.
 Voice clips: every zh-TW clip whose WAV is missing on the robot, or was rendered from other words than the
 manifest has now, is rendered again with Matcha-TTS on the robot (~/.medcare_reachy/clips/zh-TW/rendered.json
 records what each WAV says). The deploy stops when a planned clip was not written, and when any manifest clip has no
-WAV on the robot afterwards; a clip SenseVoice does not hear exactly as written is kept with a warning to listen to
-it. The check-in's 「嗯」 (ack) and thinking phrases (manifest "variants") are kept only when SenseVoice hears them as
+WAV on the robot afterwards; a clip Whisper Base does not hear exactly as written is kept with a warning to listen to
+it. The check-in's 「嗯」 (ack) and thinking phrases (manifest "variants") are kept only when Whisper Base hears them as
 words the app recognises as its own echo; otherwise they are not written and the deploy fails.
 
 Camera: Reachy Mini's daemon (reachy_mini 1.11) shares the camera with apps at IPC_FPS = 10 frames per second,
@@ -66,14 +66,14 @@ SPOKEN = {
     "thinking_2": ("讓我想一想喔。", "让我想一想哦。"),
     "thinking_3": ("我想想看喔。", "我想想看哦。"),
 }
-# Speeds a clip is rendered at, best first (the first SenseVoice hears word for word is kept). Prompts are slow for
+# Speeds a clip is rendered at, best first (the first Whisper Base hears word for word is kept). Prompts are slow for
 # older listeners; the thinking phrases carry no information and are said at the voice's own pace (about 1.1-1.3 s on
 # the laptop with the robot's model files; at 0.85 they take 1.4-1.5 s).
 DEFAULT_SPEEDS = (0.85, 0.8, 0.9)
 RENDER_SPEEDS = {"thinking_1": (1.0, 1.1, 0.9), "thinking_2": (1.0, 1.1, 0.9), "thinking_3": (1.0, 1.1, 0.9)}
 
 # Runs on the robot, after the upload: renders the clips listed in the job file, checks each by reading it back with
-# SenseVoice (a few speeds; the best match is kept), and records what every WAV says. A check-in acknowledgement
+# Whisper Base (a few speeds; the best match is kept), and records what every WAV says. A check-in acknowledgement
 # ("filler") is kept only as heard so that the app recognises its echo (voice.without_filler of the package just
 # uploaded); when no speed gives that, it is not written ("unrecognised"), so it is never played and the deploy fails.
 RENDER = r'''
@@ -114,21 +114,29 @@ if job["clips"]:
             acoustic_model=str(T / "model-steps-3.onnx"), vocoder=str(M / "tts" / "vocos-22khz-univ.onnx"),
             lexicon=str(T / "lexicon.txt"), tokens=str(T / "tokens.txt")), num_threads=2),
         rule_fsts=fsts, max_num_sentences=1))
-    asr = sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=str(M / "stt" / "model.int8.onnx"), tokens=str(M / "stt" / "tokens.txt"),
-        language="zh", use_itn=True, num_threads=2)
+    from faster_whisper import WhisperModel
+
+    asr = WhisperModel("base", device="cpu", compute_type="int8", cpu_threads=2,
+                       download_root=str(M / "stt" / "whisper"))
     for clip in job["clips"]:
         want = "".join(ch for ch in clip["text"] if ch.isalnum())
         best = None
         for speed in clip.get("speeds") or (0.85, 0.8, 0.9):
             audio = tts.generate(clip["text"], sid=0, speed=speed)
             samples = np.asarray(audio.samples, dtype=np.float32)
-            stream = asr.create_stream()
-            stream.accept_waveform(audio.sample_rate, samples)
-            asr.decode_stream(stream)
-            got = "".join(ch for ch in stream.result.text if ch.isalnum())
-            usable = not clip.get("filler") or without_filler(stream.result.text) == ""
-            print(f"render {clip['id']} speed={speed} heard={stream.result.text!r} ok={got == want}"
+            verify_wav = OUT / ".verify.wav"
+            with wave.open(str(verify_wav), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(audio.sample_rate)
+                w.writeframes((np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
+            pieces, _ = asr.transcribe(str(verify_wav), language="zh", beam_size=1,
+                                       condition_on_previous_text=False)
+            heard = "".join(piece.text for piece in pieces).strip()
+            verify_wav.unlink(missing_ok=True)
+            got = "".join(ch for ch in heard if ch.isalnum())
+            usable = not clip.get("filler") or without_filler(heard) == ""
+            print(f"render {clip['id']} speed={speed} heard={heard!r} ok={got == want}"
                   + ("" if usable else " echo-not-recognised"))
             score = difflib.SequenceMatcher(None, got, want).ratio()
             if usable and (best is None or score > best[0]):
@@ -212,7 +220,7 @@ def prepare_clips(sftp, manifest: dict) -> dict:
 
 
 def render_problems(output: str, job: dict) -> tuple[list, list]:
-    """From the render script's output: the clips it did not write, and those SenseVoice heard otherwise."""
+    """From the render script's output: the clips it did not write, and those Whisper Base heard otherwise."""
     wrote = {}
     for line in output.splitlines():
         parts = line.split()
@@ -339,6 +347,11 @@ def main() -> int:
         run(client, f"mkdir -p ~/.medcare_reachy/models/stt && cd ~/.medcare_reachy/models/stt && "
                     f"([ -s silero_vad.onnx ] || curl -sSL -o silero_vad.onnx {VAD_URL}) && ls -la silero_vad.onnx")
         print("voice activity model ready")
+        run(client, f"{PYTHON} -m pip install 'faster-whisper>=1.1,<2'", timeout=900)
+        run(client, f"{PYTHON} -c 'from pathlib import Path; from faster_whisper import WhisperModel; "
+                    f"WhisperModel(\"base\", device=\"cpu\", compute_type=\"int8\", cpu_threads=2, "
+                    f"download_root=str(Path.home() / \".medcare_reachy/models/stt/whisper\"))'", timeout=900)
+        print("Whisper Base model ready")
 
         print("clips to render:", ", ".join(stale) or "none")
         sftp = client.open_sftp()
@@ -358,13 +371,13 @@ def main() -> int:
             print(f"rendering the clips failed ({', '.join(missing) or 'see above'} not written): those keep their "
                   "old WAVs, and the next deploy renders them again")
             if unrecognised(output):
-                print(f"ERROR clips: {', '.join(unrecognised(output))} came back from SenseVoice as words the app "
+                print(f"ERROR clips: {', '.join(unrecognised(output))} came back from Whisper Base as words the app "
                       "would not recognise as Reachy's own echo (voice.without_filler), so they were not written and "
-                      "are never played. Add what SenseVoice heard (above) to THINKING_PHRASES/_SOUND_ALIKES in "
+                      "are never played. Add what Whisper Base heard (above) to THINKING_PHRASES/_SOUND_ALIKES in "
                       "voice.py, or change the phrase.")
             return 1
         if misheard:
-            print(f"WARNING clips: SenseVoice did not hear {', '.join(misheard)} exactly as written (the closest of "
+            print(f"WARNING clips: Whisper Base did not hear {', '.join(misheard)} exactly as written (the closest of "
                   "three speeds was kept). Listen to them on the robot before relying on them.")
         sftp = client.open_sftp()
         try:
