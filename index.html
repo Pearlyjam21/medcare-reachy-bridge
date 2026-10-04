@@ -1,35 +1,138 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-Hant">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>MedCare Reachy</title>
+  <meta name="theme-color" content="#f3f7f7">
+  <meta name="description" content="智伴守護 SmartGuardian：以 Reachy Mini、情緒感知與 MedAiCarePlus，串起長者、家屬與日常用藥照護。">
+  <meta property="og:title" content="智伴守護 SmartGuardian｜AI 用藥關懷機器人">
+  <meta property="og:description" content="讓服藥提醒多一份回應，讓遠方家人多一份安心。">
+  <title>智伴守護 SmartGuardian｜AI 用藥關懷機器人</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Crect width='48' height='48' rx='15' fill='%23245d63'/%3E%3Cpath d='M21 11h6v10h10v6H27v10h-6V27H11v-6h10z' fill='%23f3f7f7'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <main>
-    <h1>💊 MedCare Reachy</h1>
-    <p class="lede">A Reachy Mini app that reminds at medication time, finds the patient, prompts each medicine, and
-      watches each dose with its own camera. Intake tracking and emotion run on the robot; the MedAiCarePlus home
-      server gets landmark points, emotion scores and two identity snapshots a second, and decides what is recorded.</p>
+  <a class="skip-link" href="#main">跳至主要內容</a>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="智伴守護首頁">
+      <span class="brand-mark" aria-hidden="true"><span></span></span>
+      <span class="brand-copy"><strong>智伴守護</strong><small>SMARTGUARDIAN</small></span>
+    </a>
+    <nav aria-label="主要導覽">
+      <a href="#approach">作品理念</a>
+      <a href="#system">系統架構</a>
+      <a href="#credits">作品署名</a>
+    </nav>
+    <a class="header-link" href="https://github.com/Ferdinanzk/MedAiCarePlus" target="_blank" rel="noreferrer">MedAiCarePlus GitHub <span aria-hidden="true">↗</span></a>
+  </header>
 
-    <section>
-      <h2>Setup</h2>
-      <ol>
-        <li>In the MedAiCarePlus web app: <strong>Settings → Reachy robot → Pair</strong>, and copy the robot key.</li>
-        <li>On the server, set <code>DEVICE_BIND</code> to its home-network IP so the robot can reach port 8001.</li>
-        <li>Install <strong>MedCare Reachy</strong> from the robot's dashboard, open its settings page, and enter the server address and robot key.</li>
-      </ol>
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <p class="eyebrow"><span class="eyebrow-dot"></span> InnoServe 2026・產業 AI 創新組</p>
+        <h1 id="hero-title">智伴守護</h1>
+        <p class="hero-project-subtitle">AI 用藥關懷機器人</p>
+        <p class="hero-lede">以 Reachy Mini 為展示平台，探索用藥提醒、情緒感知與家庭關懷如何成為同一段日常陪伴。</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="#approach">閱讀作品理念 <span aria-hidden="true">↓</span></a>
+          <a class="text-link" href="https://github.com/Ferdinanzk/MedAiCarePlus" target="_blank" rel="noreferrer">專案原始碼 <span aria-hidden="true">↗</span></a>
+        </div>
+        <div class="hero-note"><span class="note-line"></span><span>從一聲提醒開始，讓關懷有來有往。</span></div>
+      </div>
+
+      <div class="hero-art" aria-label="照護訊號由機器人、AI 與家人串連的示意圖" role="img">
+        <div class="art-orbit orbit-one"></div>
+        <div class="art-orbit orbit-two"></div>
+        <div class="art-index"><span>CARE, IN MOTION</span><span>01 — 03</span></div>
+        <div class="robot-stage">
+          <svg class="robot" viewBox="0 0 300 286" aria-hidden="true">
+            <path class="robot-shadow" d="M51 254c16-13 49-20 99-20s82 7 99 20v17H51z"/>
+            <path class="robot-neck" d="M132 174h36v56c-11 11-25 11-36 0z"/>
+            <path class="robot-base" d="M100 230c11-20 32-29 50-29s39 9 50 29l17 27H83z"/>
+            <path class="robot-body-line" d="M118 228c9-9 20-13 32-13s23 4 32 13"/>
+            <path class="robot-ear" d="M73 100h19v52H73a10 10 0 0 1-10-10v-32a10 10 0 0 1 10-10zm154 0h-19v52h19a10 10 0 0 0 10-10v-32a10 10 0 0 0-10-10z"/>
+            <rect class="robot-head" x="79" y="58" width="142" height="128" rx="51"/>
+            <path class="robot-face" d="M98 119c0-14 12-25 27-25h50c15 0 27 11 27 25v26c0 12-11 22-24 22h-56c-13 0-24-10-24-22z"/>
+            <circle class="robot-eye" cx="126" cy="126" r="5"/><circle class="robot-eye" cx="174" cy="126" r="5"/>
+            <path class="robot-smile" d="M137 144q13 11 26 0"/>
+            <path class="robot-crown" d="M150 58V41"/><circle class="robot-beacon" cx="150" cy="35" r="8"/>
+            <path class="robot-cheek" d="M107 146h8m80 0h-8"/>
+          </svg>
+          <div class="orbit-label label-emotion"><span class="label-glyph">◌</span><span>心情線索<small>多模態感知</small></span></div>
+          <div class="orbit-label label-dose"><span class="label-glyph">＋</span><span>用藥時刻<small>溫柔提醒</small></span></div>
+          <div class="orbit-label label-family"><span class="label-glyph">↗</span><span>家人同在<small>遠端關懷</small></span></div>
+        </div>
+        <div class="art-caption"><span>CARE THAT CONNECTS</span><span class="caption-rule"></span><span>照護，從連結開始</span></div>
+      </div>
+      <div class="hero-bottom"><span>SMARTGUARDIAN / MEDCARE REACHY</span><span>HUALIEN, TAIWAN <i></i> 2026</span></div>
     </section>
 
-    <section class="warn">
-      <h2>Limits</h2>
-      <ul>
-        <li>Needs a MedAiCarePlus server on your home network.</li>
-        <li>Cannot identify which pill was taken or how many; unverified doses go to a family member to confirm.</li>
-        <li>Not a medical device. Prototype; frame rate on a real robot not yet measured (below 12 fps, every dose goes to a family member to confirm). No microphone.</li>
-      </ul>
+    <section class="intro section-wrap" id="approach" aria-labelledby="approach-title">
+      <div class="section-kicker"><span>01</span><span>WHY WE BUILT IT</span></div>
+      <div class="intro-grid">
+        <h2 id="approach-title">照護不只在<br>「記得吃藥」。</h2>
+        <div class="intro-text"><p>獨居與慢性病長者面對的，是規律用藥、情緒支持和家人不在身邊的日常難題；感到孤單或正經歷憂鬱低潮時，這些事情更不容易。智伴守護把提醒帶進陪伴情境，留意日常互動線索，也幫助家人持續關心。</p><p class="intro-emphasis">不是多一個通知，而是多一個願意停下來關心的角色。</p></div>
+      </div>
+      <div class="signal-row" aria-label="照護歷程：提醒、感知、連結">
+        <div class="signal-step"><span class="signal-number">01</span><div><strong>準時提醒</strong><small>把服藥融入熟悉的生活節奏</small></div></div>
+        <span class="signal-connector" aria-hidden="true">→</span>
+        <div class="signal-step"><span class="signal-number">02</span><div><strong>理解線索</strong><small>從互動中留意情緒與行為</small></div></div>
+        <span class="signal-connector" aria-hidden="true">→</span>
+        <div class="signal-step"><span class="signal-number">03</span><div><strong>家人連結</strong><small>讓需要留意的狀況有人接手</small></div></div>
+      </div>
+    </section>
+
+    <section class="system-section" id="system" aria-labelledby="system-title">
+      <div class="section-wrap">
+        <div class="section-kicker"><span>02</span><span>ONE CONNECTED CARE SYSTEM</span></div>
+        <div class="system-heading"><h2 id="system-title">一個陪伴者，<br>一條照護連線。</h2><p>機器人在家中陪伴，AI 協助整理訊號，家人透過熟悉的工具持續關心。</p></div>
+        <div class="system-map">
+          <article class="system-node node-robot"><span class="node-index">01 / IN THE HOME</span><div class="node-icon node-bot" aria-hidden="true"><span class="bot-antenna"></span><span class="bot-face"><i></i><i></i><b></b></span></div><h3>Reachy Mini</h3><p>在服藥時刻主動互動，以鏡頭觀察服藥相關動作與情緒線索。</p><span class="node-tag">居家陪伴</span></article>
+          <div class="map-link"><span>互動訊號</span><i></i><span>分析與紀錄</span></div>
+          <article class="system-node node-ai"><span class="node-index">02 / INTELLIGENCE</span><div class="node-icon node-network" aria-hidden="true"><i></i><i></i><i></i><i></i><b></b></div><h3>MedAiCarePlus</h3><p>串接用藥紀錄、情緒資訊與照護 Dashboard，協助家人掌握日常變化。</p><span class="node-tag">AI × 照護平台</span></article>
+          <div class="map-link"><span>狀況通知</span><i></i><span>遠端關懷</span></div>
+          <article class="system-node node-family"><span class="node-index">03 / BY THEIR SIDE</span><div class="node-icon node-home" aria-hidden="true"><span>⌂</span><i></i><b></b></div><h3>家人與照護者</h3><p>透過 LINE 通知與遠端紀錄，適時了解長者的用藥和情緒狀況。</p><span class="node-tag">安心有連結</span></article>
+        </div>
+        <p class="system-footnote"><span>DESIGNED FOR HUMAN CONNECTION</span><span>設計的核心，是讓照護訊號回到人的手中。</span></p>
+      </div>
+    </section>
+
+    <section class="principles section-wrap" aria-labelledby="principles-title">
+      <div class="section-kicker"><span>03</span><span>BUILT WITH CARE</span></div>
+      <div class="principles-heading"><h2 id="principles-title">把關懷落實在<br>每一個設計選擇。</h2><p>從長者的使用感受出發，也把資料邊界與照護責任說清楚。</p></div>
+      <div class="principle-list">
+        <article><span class="principle-mark">A</span><div><h3>實體互動，降低使用門檻</h3><p>用有表情、有回應的陪伴機器人，讓提醒不必依賴長者操作複雜介面。</p></div><span class="principle-aside">HUMAN FIRST</span></article>
+        <article><span class="principle-mark">B</span><div><h3>多模態線索，補上照護脈絡</h3><p>結合影像、語音與文字等情緒訊號，提供家人更完整的日常觀察。</p></div><span class="principle-aside">MULTIMODAL AI</span></article>
+        <article><span class="principle-mark">C</span><div><h3>不確定時，交由家人確認</h3><p>機器人不能確認藥品種類或數量；無法驗證的服藥情況會交由家人確認。</p></div><span class="principle-aside">HUMAN OVERSIGHT</span></article>
+      </div>
+    </section>
+
+    <section class="credits-section" id="credits" aria-labelledby="credits-title">
+      <div class="section-wrap">
+        <div class="section-kicker"><span>04</span><span>PROJECT CREDIT</span></div>
+        <div class="credits-heading">
+          <h2 id="credits-title">作品署名</h2>
+          <p>本頁呈現慈濟大學參賽作品「智伴守護：AI 用藥關懷機器人」之設計理念與系統構想。</p>
+        </div>
+        <dl class="credits-list">
+          <div><dt>競賽</dt><dd>2026 第 31 屆大專校院資訊應用服務創新競賽</dd></div>
+          <div><dt>參賽組別</dt><dd>產業 AI 創新組</dd></div>
+          <div><dt>學校</dt><dd>慈濟大學</dd></div>
+          <div><dt>作品團隊</dt><dd>慈濟大學參賽團隊</dd></div>
+          <div><dt>作品名稱</dt><dd>智伴守護：AI 用藥關懷機器人 <span lang="en">SmartGuardian: AI Medication Care Bot</span></dd></div>
+          <div><dt>展示平台</dt><dd>Reachy Mini × MedAiCarePlus</dd></div>
+          <div><dt>專案原始碼</dt><dd><a href="https://github.com/Ferdinanzk/MedAiCarePlus" target="_blank" rel="noreferrer">github.com/Ferdinanzk/MedAiCarePlus <span aria-hidden="true">↗</span></a></dd></div>
+        </dl>
+      </div>
+    </section>
+
+    <section class="notice section-wrap" aria-label="使用說明與提醒">
+      <span class="notice-symbol" aria-hidden="true">i</span>
+      <div><strong>研究與展示原型，非醫療器材。</strong><p>系統不會自行判定服藥完成，亦無法識別實際服用的藥品或數量。情緒線索不代表憂鬱症診斷，不能取代專業評估或醫療建議。</p></div>
+      <span class="notice-label">CARE WITH CLARITY</span>
     </section>
   </main>
+
+  <footer class="site-footer"><a class="footer-brand" href="#top">智伴守護 <span>SMARTGUARDIAN</span></a><p>慈濟大學・AI 用藥關懷機器人</p><a class="github-footer" href="https://github.com/Ferdinanzk/MedAiCarePlus" target="_blank" rel="noreferrer">查看 MedAiCarePlus 專案原始碼 <span aria-hidden="true">↗</span></a></footer>
 </body>
 </html>
