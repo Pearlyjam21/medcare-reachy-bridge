@@ -44,6 +44,9 @@ is downloaded at run time.
 - Follows the server's overdose protection: when the server refuses a dose (not due yet, too soon after the last one,
   the day's maximum reached, or missed too long ago), the robot says the server's one-sentence reason once and moves
   on to the next medicine. It never retries that dose in the same reminder.
+- During check-in chats, Reachy keeps recent turns in context and uses the server's current weather. If rain spoils an
+  outing the patient was looking forward to, it acknowledges the disappointment and offers gentle company; the
+  after-chat summary can classify clearly expressed disappointment as sad.
 - Fails safe: stops and puts the robot to sleep if the server is unreachable or the robot key is revoked.
 - No microphone in this version.
 - **Not a medical device.** Prototype software. Prompt wording is pending clinician review. Prerecorded prompt clips
