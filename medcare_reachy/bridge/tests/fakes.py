@@ -36,6 +36,10 @@ class FakeRobot:
         self.calls.append("is_reachable")
         return self.reachable
 
+    def restore_media(self):
+        self.calls.append("restore_media")
+        return True
+
     def wake(self):
         self.calls.append("wake")
 
@@ -168,12 +172,23 @@ class FakeSpeaker:
         return True
 
 
+class FakeCamera:
+    """CameraWatchdog stand-in: tests set `state`."""
+
+    def __init__(self):
+        self.state = "idle"
+
+    def snapshot(self):
+        return {"state": self.state, "fps": 0.0, "since": None, "media": None}
+
+
 class FakeStream:
     def __init__(self):
         self.attached = None
         self.latest = None
         self.errors = []
         self.history = []
+        self.camera = FakeCamera()
 
     def attach(self, monitor):
         self.attached = monitor

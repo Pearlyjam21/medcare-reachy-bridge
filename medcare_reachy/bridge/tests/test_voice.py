@@ -158,7 +158,7 @@ def test_negated_speech_is_not_a_claim(tmp_path):
 
 
 def chat_listener(tmp_path, words, decode_seconds=0.0, gates=()):
-    """A chat listener on a fake clock (stopped at 100 s) whose Whisper Base takes `decode_seconds` of it per segment,
+    """A chat listener on a fake clock (stopped at 100 s) whose SenseVoice takes `decode_seconds` of it per segment,
     and, for the n-th segment, first waits for gates[n] to be set."""
     for name in STT_FILES:
         (tmp_path / name).write_bytes(b"x")
@@ -353,7 +353,7 @@ def test_chat_tells_the_session_the_patient_paused_before_their_words_are_decode
         assert wait_for(lambda: voice.heard_pause() is not None)
         # Two windows of speech, then the two of silence that ended it: the patient stopped 64 ms before 100 s.
         assert voice.heard_pause() == pytest.approx(100.0 - 2 * VAD_WINDOW / SAMPLE_RATE)
-        assert voice.take_utterance() is None                        # Whisper Base is still on it
+        assert voice.take_utterance() is None                        # SenseVoice is still on it
         decoding.set()
         text, metrics = take_when_ready(voice)
         assert text == "我早上去散步了" and "ack_ms" not in metrics   # no 「嗯」, no 「嗯」 timings
@@ -534,7 +534,7 @@ SYLLABLES = {0.11: "我", 0.22: "不", 0.33: "想", 0.44: "活", 0.55: "了"}   
 
 def resumed_sentence(models_dir, pause: float, acknowledge: bool) -> str:
     """The patient says 「我不想」, pauses, then 「活了」: microphone audio arrives in 10 ms buffers in real time (and piles
-    up while Whisper Base decodes, 0.6 s per s of speech), and the session says a 0.4 s 「嗯」 at its first 0.2 s tick
+    up while SenseVoice decodes, 0.6 s per s of speech), and the session says a 0.4 s 「嗯」 at its first 0.2 s tick
     after the VAD released 「我不想」. Returns everything heard."""
     levels = {word: level for level, word in SYLLABLES.items()}
     audio = np.concatenate([np.zeros(int(0.3 * SAMPLE_RATE), np.float32)]
@@ -571,7 +571,7 @@ def resumed_sentence(models_dir, pause: float, acknowledge: bool) -> str:
     def transcribe(segment):
         decoded = clock[0] + 0.6 * len(segment) / SAMPLE_RATE
         with lock:
-            acknowledge_by(decoded)   # the session ticks on while Whisper Base decodes
+            acknowledge_by(decoded)   # the session ticks on while SenseVoice decodes
         clock[0] = decoded
         heard = []
         for start in range(0, len(segment), SAMPLE_RATE // 20):

@@ -15,7 +15,7 @@ section { background: var(--card); border: 1px solid var(--border); border-radiu
 .state { font-weight: 600; margin: 0; }
 .state[data-state="running"] { color: var(--ok); }
 .state[data-state="error"] { color: var(--bad); }
-.state[data-state="not_configured"], .state[data-state="starting"] { color: var(--warn); }
+.state[data-state="not_configured"], .state[data-state="starting"], .state[data-state="stopping"] { color: var(--warn); }
 dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 12px 0; }
 dt { color: var(--muted); }
 dd { margin: 0; }
@@ -30,4 +30,5 @@ label.check small { display: block; }
 button { font: inherit; font-weight: 600; min-height: 44px; padding: 10px 18px; border-radius: 10px; border: 0;
          background: var(--accent); color: #fff; cursor: pointer; }
 button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+button:disabled { opacity: 0.55; cursor: progress; }
 .error { color: var(--bad); margin: 0; min-height: 1.2em; }

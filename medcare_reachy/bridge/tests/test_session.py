@@ -10,6 +10,15 @@ READY_UNCERTAIN = {"event_id": "ev1", "decision": "uncertain", "confidence": 0.3
 RECORDED = {"event_id": "ev1", "status": "taken"}
 
 
+@pytest.mark.parametrize("reason", ["upcoming", "checkin"])
+def test_a_task_asks_for_the_robots_media_back_before_it_wakes_and_greets(reason):
+    # Final review of 11 Oct (R1): a camera recovery the daemon refused leaves the speaker and microphone off; the
+    # greeting needs them.
+    h = Harness(make_task([] if reason == "checkin" else [dose(1)], reason=reason, checkin=reason == "checkin"))
+    h.tick()
+    assert h.robot.calls[:3] == ["is_reachable", "restore_media", "wake"]
+
+
 def test_happy_path_two_doses_recorded_then_post_slot_and_wind_down():
     h = Harness(make_task([dose(1), dose(2)]))
     h.find_patient()
@@ -492,3 +501,25 @@ def test_process_shutdown_ends_the_session_but_keeps_the_lease():
     h.tick()
     assert h.slot.done and ("monitor_end", "s2") in h.app.calls
     assert h.statuses() == ["searching", "in_progress"] and h.robot.calls[-1] == "sleep"
+
+
+@pytest.mark.parametrize("reason", ["upcoming", "checkin"])
+def test_a_search_whose_camera_is_unavailable_ends_as_not_found_with_the_reason(reason):
+    h = Harness(make_task([] if reason == "checkin" else [dose(1)], reason=reason))
+    h.to_state("SEARCHING")
+    h.tick()                                              # the search session streams
+    h.stream.camera.state = "stalled"                     # recovering: the search goes on
+    h.tick(5)
+    h.stream.camera.state = "recovering"
+    h.tick(5)
+    assert not h.slot.done and h.slot.state == "SEARCHING"
+    played = list(h.clips.played)
+    h.stream.camera.state = "unavailable"                 # the watchdog gave up
+    h.tick(0.5)
+    assert h.slot.done and h.slot.result == "camera_unavailable"
+    assert h.statuses() == ["searching", "not_found"]
+    assert h.app.named("task_status")[-1] == ("task_status", "not_found",
+                                              {"reason": "camera_unavailable", "outcomes": {}})
+    assert ("monitor_end", "s1") in h.app.calls and h.robot.calls[-1] == "sleep"
+    assert h.clips.played == played                       # nothing extra said
+    assert h.app.named("confirmation") == []

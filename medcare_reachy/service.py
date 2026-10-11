@@ -15,15 +15,6 @@ from medcare_reachy.settings_store import SettingsStore
 
 log = logging.getLogger("medcare_reachy")
 CLIPS_DIR = Path(__file__).resolve().parent / "bridge" / "clips"
-
-
-def _clips_root_dir(language: str) -> Path:
-    """Use rendered robot-storage clips when present, so reinstalling the package keeps its voice clips."""
-    persistent = Path.home() / ".medcare_reachy" / "clips"
-    language_dir = persistent / language
-    if language_dir.is_dir() and any(language_dir.glob("*.wav")):
-        return persistent
-    return CLIPS_DIR
 STEP_TEXT = {
     "WAKE": "Waking up for a medication reminder.",
     "ANNOUNCE": "Announcing the medication reminder.",
@@ -55,12 +46,12 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
         engine = await asyncio.to_thread(VisionEngine, models_dir)
         emotion = await asyncio.to_thread(EmotionEngine, models_dir / models.EMOTION_MODEL)
     robot = ReachyRobot.attach(reachy_mini)
-    clips = ClipPlayer(robot, _clips_root_dir(settings["language"]), settings["language"])
+    clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
     clips.audit()
     # A check-in turn Reachy answered with its 「嗯」 is followed, once handed over, by a thinking phrase.
     voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud)
     voice.start()
-    speaker = Speaker(robot, settings.get("elevenlabs_api_key", ""), settings.get("elevenlabs_voice_id"))
+    speaker = Speaker(robot)
     speaker.preload()
     try:
         async with AppClient(settings["app_url"], settings["device_token"]) as app:
@@ -86,7 +77,11 @@ class BridgeService:
         self.models_dir = models_dir
         self.bridge = bridge
         self._lock = threading.Lock()
+        # The settings page's requests run on a thread pool, so two restarts can overlap (a double click, or Save
+        # right after Restart). Interleaved, they once left two bridges driving the same robot.
+        self._restart_lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        self._stop_requested = False   # stop() was called for the tracked thread, maybe before it had a runner
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner = None
         self._state = "connecting_robot" if reachy_mini is None else "stopped"
@@ -106,12 +101,15 @@ class BridgeService:
             if self.reachy_mini is None:
                 return   # settings are saved; run() starts the bridge once the robot is attached
             if self._thread and self._thread.is_alive():
+                # Never two bridges on one robot: the tracked one is still running, or still stopping.
+                log.warning("a bridge thread is still running; not starting a second one")
                 return
             settings = self.store.load()
             if not SettingsStore.configured(settings):
                 self._set("not_configured", "Enter the server address and robot key on this page.")
                 return
             self._set("starting", "Connecting to the server…")
+            self._stop_requested = False
             self._thread = threading.Thread(target=self._thread_main, args=(settings,),
                                             name="medcare-bridge", daemon=True)
             self._thread.start()
@@ -119,24 +117,32 @@ class BridgeService:
     def stop(self, timeout: float = 15.0) -> None:
         with self._lock:
             thread, loop, runner = self._thread, self._loop, self._runner
+            self._stop_requested = True   # a bridge still starting has no runner to signal yet: _on_runner stops it
         if loop and runner:
             loop.call_soon_threadsafe(runner.request_shutdown)
         if thread:
             thread.join(timeout)
-            if thread.is_alive():
-                log.warning("bridge thread did not stop within %.0f s", timeout)
         with self._lock:
+            if thread is not None and thread.is_alive():
+                # Keep tracking it: a forgotten live bridge once kept running beside its replacement. start()
+                # refuses until it has ended, and its own exit then sets the state.
+                log.warning("bridge thread did not stop within %.0f s; a new one starts only after it ends", timeout)
+                self._set("stopping", "The previous connection is still closing. Press Restart in a moment.")
+                return
+            if self._thread is not thread:
+                return   # start() ran meanwhile (the app starting up): the new bridge is the tracked one
             self._thread = None
             if self._state not in ("error", "not_configured", "connecting_robot"):
                 self._set("stopped", "")
 
     def restart(self) -> None:
-        self.stop()
-        self.start()
+        with self._restart_lock:   # one restart at a time (see __init__)
+            self.stop()
+            self.start()
 
     def _current(self) -> bool:
-        """Whether the calling bridge thread is still the service's one: a thread that outlived stop()'s
-        timeout must not overwrite the state of the bridge that replaced it."""
+        """Whether the calling bridge thread is the service's one. stop() keeps tracking a bridge thread until it
+        has ended, so this guards against a thread the service no longer tracks."""
         return self._thread is threading.current_thread()
 
     def _thread_main(self, settings: dict) -> None:
@@ -167,9 +173,14 @@ class BridgeService:
 
     def _on_runner(self, runner) -> None:
         with self._lock:
-            if self._current():
-                self._runner = runner
+            if not self._current():
+                return
+            self._runner = runner
+            stop_now = self._stop_requested
+            if not stop_now:
                 self._set("running", "Waiting for a medication reminder from the server.")
+        if stop_now:
+            runner.request_shutdown()   # stop() came while this bridge was still starting: it had no runner then
 
     def _set(self, state: str, detail: str) -> None:
         self._state, self._detail, self._since = state, detail, time.time()

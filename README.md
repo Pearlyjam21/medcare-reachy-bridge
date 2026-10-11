@@ -29,9 +29,7 @@ Anything it can't verify goes to a family member to confirm on LINE.
 2. On the server, let the robot reach the device port: set `DEVICE_BIND` in `.env` to the server's home-network IP
    and restart (`docker compose up -d app`). Never expose this port to the internet.
 3. Install **MedCare Reachy** from the robot's dashboard and open its settings page. Enter the server address
-   (e.g. `http://192.168.1.20:8001`), the robot key, and your ElevenLabs API key. Select a voice ID that supports
-   Mandarin Chinese, then **Save and connect**. The API key is stored in the robot's private settings file and is
-   never sent back to the settings page.
+   (e.g. `http://192.168.1.20:8001`) and the robot key, then **Save and connect**.
 
 The vision and emotion models ship inside the app (about 55 MB) and are checked against pinned SHA-256s at every start; nothing
 is downloaded at run time.
@@ -44,14 +42,10 @@ is downloaded at run time.
 - Follows the server's overdose protection: when the server refuses a dose (not due yet, too soon after the last one,
   the day's maximum reached, or missed too long ago), the robot says the server's one-sentence reason once and moves
   on to the next medicine. It never retries that dose in the same reminder.
-- During check-in chats, Reachy keeps recent turns in context and uses the server's current weather. If rain spoils an
-  outing the patient was looking forward to, it acknowledges the disappointment and offers gentle company; the
-  after-chat summary can classify clearly expressed disappointment as sad.
 - Fails safe: stops and puts the robot to sleep if the server is unreachable or the robot key is revoked.
 - No microphone in this version.
-- **Not a medical device.** Prototype software. Prompt wording is pending clinician review. Prerecorded prompt clips
-  are rendered on the robot during deployment; live replies and refusal speech require the ElevenLabs API key and
-  internet access.
+- **Not a medical device.** Prototype software. Prompt wording is pending clinician review, and no voice clips are
+  included yet, so the robot is silent until they're added.
 
 ## How vision runs on the robot
 
@@ -82,10 +76,39 @@ on your robot over SSH:
 
 While a reminder runs, the settings page also shows the live **Camera landmarks** rate.
 
+## When the camera stops
+
+From 0.7.0 the app watches its camera while it looks for the patient or watches a dose:
+
+- **No new frame for 2 seconds** is a stall. The app logs an error with the robot daemon's media status and tries to
+  get the camera back, at most once every 5 seconds: when the daemon says the camera was released, the app asks for it
+  back; otherwise it reopens its own camera feed. A slow camera is not a stall; only a 2-second gap is. The stall is
+  over only after 5 seconds of steady frames, so a camera that gives one frame and stops again is still in the same
+  stall.
+- **Still no steady frames 15 seconds after the stall began:** the app ends the search with the reason
+  `camera_unavailable` and puts the robot to sleep. The server then handles the reminder as for a patient it could not
+  find; the camera alone never records or skips a dose.
+- **The speaker and microphone share the camera's link.** When the daemon refuses to give the camera back, they are
+  off too. The app then asks for them back with the heartbeat and before each reminder or check-in, at most once a
+  minute while the daemon keeps refusing, and when it gives up on the camera while they are still off, it logs an
+  error saying so.
+- The heartbeat tells the server the camera state, and the web app's Reachy card shows "Robot camera not working".
+
+**Don't run TCU's Reachy AI Companion at the same time.** It connects to the robot without media
+(`media_backend="no_media"`), and Reachy Mini's SDK 1.11.0 then makes the daemon release the camera and audio. This
+app's camera feed stops. From 0.7.0 the app asks for it back when it notices, during a search or a dose watch (see
+above), but the companion can take it again at any time. Disable the companion at boot over SSH
+(`sudo systemctl disable --now reachy-ai-companion`); it also uses this app's port, 8042. To check the camera over
+SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when another program took it, and
+`curl -s -X POST localhost:8000/api/media/acquire` gives it back.
+
 ## Status
 
-- **0.6.0**: ElevenLabs Flash v2.5 handles live Mandarin speech; the deploy tool renders and verifies prompt clips
-  with the configured voice. The API key stays in the robot's private settings file.
+- **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
+  about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
+  Two quick restarts from the settings page no longer start two copies of the app's worker.
+- 0.7.0 is the version on this space since 12 Oct 2026. The space's history also holds an ElevenLabs voice line
+  (0.6.0, 4-5 Oct) that is not in 0.7.0; it is kept for a later version.
 - **0.3.0**: emotion is scored on the robot too; snapshots to the server are identity-only, 2 a second (was 5).
 - **0.2.0**: vision runs on the robot (above). Tested against MediaPipe and the Reachy Mini simulator; frame rate on
   a real robot is not measured yet; run the bench above.

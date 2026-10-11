@@ -195,6 +195,9 @@ class SlotSession:
         if not await self._robot("is_reachable"):
             await self._shutdown("robot_offline", status="aborted")
             return
+        # A camera recovery the daemon refused may have left the speaker and the microphone off: the greeting needs
+        # them (ReachyRobot.restore_media, which never raises).
+        await self._robot("restore_media")
         await self._robot("wake")
         await self._advance("searching")
         self._go(ANNOUNCE)
@@ -213,6 +216,12 @@ class SlotSession:
             self.entered = True
             self.next_scan_at = now
             self.next_search_clip_at = now + SEARCH_CLIP_INTERVAL
+        if self.stream.camera.state == "unavailable":
+            # The camera watchdog gave up (no new frame for 15 s after the camera stalled, recoveries included): end
+            # the search now, as for any not_found, rather than look around blind for 10 minutes.
+            log.warning("slot %s: the camera is unavailable; the search ends", self.task_id)
+            await self._shutdown("camera_unavailable", status="not_found")
+            return
         if now - self.since >= SEARCH_TIMEOUT:
             await self._shutdown("not_found", status="not_found")
             return

@@ -7,6 +7,7 @@ from collections import deque
 
 from medcare_reachy.bridge import __version__
 from medcare_reachy.bridge.app_client import BridgeError, NotAuthorised
+from medcare_reachy.bridge.camera_watch import NOT_WORKING, CameraWatchdog
 from medcare_reachy.bridge.session import SlotSession
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,15 @@ HEARTBEAT_SECONDS = 10.0
 TICK_SECONDS = 0.2
 TASK_WAIT = 25
 RESUMABLE = frozenset({"app_unreachable"})   # slot results that leave the task leased to us
+
+
+def _cannot_reopen() -> str:
+    """The camera watchdog's recovery for a robot without reopen_camera() (VideoFileRobot, test cameras)."""
+    return "failed: this robot can't reopen its camera"
+
+
+def _no_media_status() -> None:
+    return None
 
 
 def encode_stream_jpeg(frame) -> bytes:
@@ -86,13 +96,19 @@ class MonitorStream:
     A frame that finds no free slot is dropped rather than queued. frame_seq restarts at 1 for every
     session; timestamps are capture times.
     A gap over STALL_SECONDS between streamed frames is logged with what held it up (see _note_stall).
+    `camera` (camera_watch.CameraWatchdog) follows every read of an attached session: frame() for a new frame,
+    tick() (off the event loop: a recovery blocks) for none. By default it recovers with the robot's
+    reopen_camera() and logs its media_status(); the heartbeat sends its snapshot().
     """
 
     def __init__(self, app, robot, engine, *, clock=time.monotonic, run_blocking=asyncio.to_thread,
                  encode=encode_jpeg, stream_encode=encode_stream_jpeg, fps=CAPTURE_FPS,
                  vision_interval=VISION_INTERVAL, emotion=None, emotion_interval=EMOTION_INTERVAL,
-                 max_in_flight=MAX_FRAMES_IN_FLIGHT):
+                 max_in_flight=MAX_FRAMES_IN_FLIGHT, camera=None):
         self.app, self.robot, self.engine = app, robot, engine
+        self.camera = camera if camera is not None else CameraWatchdog(
+            getattr(robot, "reopen_camera", _cannot_reopen), getattr(robot, "media_status", _no_media_status),
+            clock=clock, media_released=getattr(robot, "media_released", None))
         self.emotion, self.emotion_interval = emotion, emotion_interval
         self._last_emotion = float("-inf")
         self.clock, self.run_blocking, self.encode, self.stream_encode = clock, run_blocking, encode, stream_encode
@@ -135,10 +151,12 @@ class MonitorStream:
         self._stalls = 0
         self._camera_asked = None
         self._clear_stall_notes()
+        self.camera.attach()
 
     def detach(self) -> None:
         self.session = None
         self.latest = None
+        self.camera.detach()
 
     def take_error(self) -> Exception | None:
         error, self._error = self._error, None
@@ -191,8 +209,12 @@ class MonitorStream:
             return
         frame = await self.run_blocking(self.robot.get_frame)
         captured = self.clock()
-        if frame is None or self.session is not session:
+        if self.session is not session:
             return
+        if frame is None:
+            await self.run_blocking(self.camera.tick)   # a recovery blocks for a while: never on the event loop
+            return
+        self._camera_seen()
         self.frame_seq += 1
         seq = self.frame_seq
         packet = await self.run_blocking(self.engine.process, frame, seq, captured * 1000.0)
@@ -216,10 +238,12 @@ class MonitorStream:
         if frame is None:
             if self._camera_asked is None:
                 self._camera_asked = asked
+            await self.run_blocking(self.camera.tick)   # a recovery blocks for a while: never on the event loop
             return
         self._camera_wait = max(self._camera_wait, captured - (asked if self._camera_asked is None
                                                                else self._camera_asked))
         self._camera_asked = None
+        self._camera_seen()
         self._note_camera_frame(captured)
         if captured < self._next_due - self.interval * PACE_EARLY:
             return   # the camera runs faster than the stream: skip this one
@@ -274,6 +298,15 @@ class MonitorStream:
                             self._no_slot, self._oldest_request)
                 self._stalls = 0
         self._clear_stall_notes()
+
+    def _camera_seen(self) -> None:
+        """A new camera frame for the watchdog. After a stall the slow-camera warning may fire again, measured from
+        the recovery."""
+        recovered = self.camera.state in NOT_WORKING
+        self.camera.frame()
+        if recovered:
+            self._slow_camera_logged = False
+            self._streaming_since = None
 
     def _note_camera_frame(self, captured: float) -> None:
         """Count camera frames, and say once in the log when the camera alone keeps the server from recording."""
@@ -460,11 +493,15 @@ class Runner:
             self.robot_reachable = bool(await self.run_blocking(self.robot.is_reachable))
         except Exception:
             self.robot_reachable = False
+        if self.robot_reachable:
+            # A camera recovery the daemon refused leaves this app's media released, the speaker and the microphone
+            # with it, and outside a stalled session nothing else asks for it back (restore_media never raises).
+            await self.run_blocking(self.robot.restore_media)
         payload = {"robot_reachable": self.robot_reachable, "landmark_fps": self.stream.landmark_fps(),
                    "vision_fps": self.stream.vision_fps(), "bridge_version": __version__,
                    "missing_clips": self.clips.missing_count}
         try:
-            response = await self.app.heartbeat(payload)
+            response = await self.app.heartbeat(payload, camera=self.stream.camera.snapshot())
         except NotAuthorised:
             response = {"stop_all": True, "microphone": False}   # revoked device or withdrawn consent
         except BridgeError as exc:

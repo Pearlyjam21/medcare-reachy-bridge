@@ -1,4 +1,4 @@
-"""Speech-to-text on the robot: "I finished" while a dose is watched, and the patient's words in a check-in.
+"""Whisper Base speech-to-text on the robot: "I finished" while a dose is watched, and words in check-ins.
 
 The slot session turns listening on only while a dose is watched (robot_microphone consent) or during a check-in
 conversation (all check-in consents), and mutes it while the robot speaks. Audio stays in memory: silero VAD cuts
@@ -12,7 +12,7 @@ The session learns that the patient paused as soon as the VAD releases their wor
 are decoded, so Reachy can answer at once with a 「嗯」 (`note_ack()`). Once the words it answered are handed over,
 Reachy says it is thinking about them (「我再想一下喔。」, `think_aloud`, `note_filler()`): only then, so a patient
 going on after their pause is never talked over within one turn (their words and Reachy's echo mixed in one segment
-came out of Whisper Base garbled, losing 「活」 of 「我不想…活了」), and a cough that decodes to nothing gets no promise of
+came out of SenseVoice garbled, losing 「活」 of 「我不想…活了」), and a cough that decodes to nothing gets no promise of
 an answer. The microphone stays on meanwhile, and nothing it hears is ever silenced: should the 「嗯」 or the phrase
 come back through it, it is recognised by its words and dropped.
 """
@@ -49,12 +49,12 @@ ACK_ECHO_SECONDS = 0.5
 # while Reachy's 「嗯」 may still be echoing, or being decoded, is waited for (its words decide) up to THINK_WAIT_SECONDS.
 THINK_AFTER_SECONDS = 0.5
 THINK_WAIT_SECONDS = 2.0
-# How Whisper Base writes a 「嗯」 or a filler like it, at the start of a transcript. Characters that also begin
+# How Whisper writes a 「嗯」 or a filler like it, at the start of a transcript. Characters that also begin
 # words (恩人, 额头, 唔係, 哼歌) count only on their own.
 ACK_LEAD = re.compile(r"^(?:[\W_]*(?:[嗯呃]+|[恩额唔哼]+(?![^\W_])|m+-?h?m+(?![a-z])|hm+(?![a-z])))+[\W_]*",
                       re.IGNORECASE)
 # Reachy's thinking phrases (clips/manifest.json "variants" > "thinking": 「我再想一下喔。」「讓我想一想喔。」
-# 「我想想看喔。」) in the Simplified words Whisper Base writes back. Rendered with the robot's voice and played through
+# 「我想想看喔。」) in the Simplified words Whisper writes back. Rendered with the robot's voice and played through
 # a simulated speaker and room, it wrote them word for word, or without the closing 哦; with the echo's start or end
 # lost, the rest of the phrase (THINKING_FORMS); also 在 for 再 and 喔 for 哦, and with the patient talking at the
 # same time 叫 for 让 and 享/响 for 想 (_SOUND_ALIKES).
@@ -100,7 +100,7 @@ LANGUAGE_CODES = {"zh-TW": "zh", "en": "en"}
 # came in every slot state, mostly with the listener off, so they have another cause (runner.py logs them).
 VOICE_NICE = 5
 
-# Substrings of what Whisper Base writes (Simplified or Traditional Chinese, or English) when someone says they
+# Substrings of what Whisper writes (Simplified or Traditional Chinese, or English) when someone says they
 # have taken it. Any negation voids the match: "還沒吃完" is not "吃完".
 DONE_WORDS = ("吃完", "吃好", "吃了", "吃过", "吃過", "吞了", "吞下", "服用了", "好了", "完成",
               "finished", "done", "took it", "taken")
@@ -148,7 +148,7 @@ class _Heard(NamedTuple):
     speech: float      # seconds of voiced audio
     ended: float       # when the patient stopped speaking
     released: float    # when the VAD released the segment
-    decode: float      # seconds Whisper Base took
+    decode: float      # seconds Whisper took
 
 
 class _MicClock:
@@ -220,7 +220,6 @@ def _speech_models(models_dir: Path, language: str):
                 "base", device="cpu", compute_type="int8", cpu_threads=2,
                 download_root=str(models_dir / "whisper"))
         recognizer = _whisper_models[key]
-
     config = sherpa_onnx.VadModelConfig()
     config.silero_vad.model = str(models_dir / "silero_vad.onnx")
     config.silero_vad.min_silence_duration = MIN_SILENCE_SECONDS
@@ -236,6 +235,7 @@ def _speech_models(models_dir: Path, language: str):
         return "".join(chunk.text for chunk in chunks).strip()
 
     return vad, transcribe
+
 
 class DoneListener:
     """Background thread pulling the robot's microphone.
@@ -449,7 +449,7 @@ class DoneListener:
             return self._active and self._holds == 0 and self.clock() >= self._released_at + tail
 
     def _run(self) -> None:
-        lower_thread_priority()   # before loading: ONNX Runtime's decoder threads start from this one
+        lower_thread_priority()   # before loading: model worker threads inherit the lower priority
         try:
             vad, transcribe = self._load(self.models_dir, self.language)
         except Exception:

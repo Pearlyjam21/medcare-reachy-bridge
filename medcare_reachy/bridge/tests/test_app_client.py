@@ -278,3 +278,22 @@ def test_failed_timings_raise_but_never_start_an_outage(failure):
             return client.unreachable_since              # the conversation itself still counts
 
     assert run(scenario()) == 100.0
+
+
+def test_heartbeat_sends_the_camera_only_when_given():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"stop_all": False})
+
+    camera = {"state": "stalled", "fps": 0.0, "since": 1760000000.0,
+              "media": {"available": False, "released": True, "no_media": False}}
+
+    async def scenario():
+        async with make_client(handler) as client:
+            await client.heartbeat({"robot_reachable": True})
+            await client.heartbeat({"robot_reachable": True}, camera=camera)
+
+    run(scenario())
+    assert bodies == [{"robot_reachable": True}, {"robot_reachable": True, "camera": camera}]

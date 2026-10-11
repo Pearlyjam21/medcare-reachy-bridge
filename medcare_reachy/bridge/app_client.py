@@ -168,8 +168,11 @@ class AppClient:
         return await self._request("POST", f"/api/device/tasks/{task_id}/extra-event",
                                    json={"event_id": event_id, "decision": decision, "confidence": confidence})
 
-    async def heartbeat(self, payload: dict) -> dict:
-        return await self._request("POST", "/api/device/heartbeat", json=payload) or {}
+    async def heartbeat(self, payload: dict, camera: dict | None = None) -> dict:
+        """`camera`: the camera watchdog's snapshot (state, fps, since, media), sent as "camera" when given. Servers
+        before it ignore the key."""
+        body = payload if camera is None else {**payload, "camera": camera}
+        return await self._request("POST", "/api/device/heartbeat", json=body) or {}
 
     # ── monitor ──────────────────────────────────────────────────────────
     async def monitor_start(self, mode: str, intk_id: int | None, task_id: str) -> dict:
