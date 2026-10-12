@@ -38,6 +38,7 @@ RECENTER_LIMIT = {"head_deg": 15.0, "head_mm": 20.0, "body_deg": 8.0, "antenna_d
 DAEMON_PORT = 8000
 MEDIA_STATUS_TIMEOUT = 2.0   # seconds: the camera watchdog logs the daemon's media status with every stall
 RESTORE_RETRY_SECONDS = 60.0   # restore_media(): while the daemon refuses, ask again at most this often
+RECORDING_RETRY_SECONDS = 5.0  # get_audio(): after the microphone failed to start, try again this often
 LIVE_RATE = 16000   # the live chat's audio (bridge/live.py): the robot's own rate, so the SDK needs no resampling
 # stop_live_audio(): the SDK still plays what the live chat pushed last, about 0.17 s through its pipeline plus its
 # 50 ms sink buffer (audio_gstreamer.py PLAYBACK_SINK_BUFFER_TIME_US); the next clip waits that out.
@@ -151,6 +152,9 @@ class ReachyRobot:
         self._restore_failing = False   # restore_media(): the daemon refused, already logged for this streak
         self._restore_retry_at = 0.0    # restore_media(): when a refused streak may ask the daemon again
         self._now = time.monotonic      # clock for restore_media()'s retry pace (tests replace it)
+        self._recording_media = None    # get_audio(): the media manager whose microphone this app has started
+        self._recording_retry_at = 0.0  # get_audio(): after a failed start, when to try again
+        self._recording_failed = False  # get_audio(): a failed start is already logged
         # Gestures start only after hold_head() and stop for every other move (wake, sleep, look_around, close).
         self._gestures = Gestures(self._send_gesture, ready=self._motors_on, start_from=self._start_pose,
                                   move=thinking_move())
@@ -216,10 +220,35 @@ class ReachyRobot:
         media = self._media()
         if media is None:
             return None
+        self._ensure_recording(media)
         samples = media.get_audio_sample()
         if samples is None or len(samples) == 0:
             return None
         return np.asarray(samples, dtype=np.float32), int(media.get_input_audio_samplerate())
+
+    def _ensure_recording(self, media) -> None:
+        """Start the SDK's microphone pipeline once per media manager (acquire_media() builds a new one).
+
+        Reachy Mini SDK 1.8.3, which the robot came back with after its reset on 12 Oct 2026, keeps the microphone
+        in a pipeline of its own that runs only after start_recording(), and nothing else calls it: every read was
+        empty, so neither 「我吃完了」 nor a check-in was ever heard. Starting it again is harmless (it only sets the
+        pipeline playing). A failed start is logged once and tried again after RECORDING_RETRY_SECONDS."""
+        if self._recording_media is media:
+            return
+        now = self._now()
+        if now < self._recording_retry_at:
+            return
+        try:
+            media.start_recording()
+        except Exception:
+            if not self._recording_failed:
+                log.exception("the microphone did not start; trying again every %.0f s", RECORDING_RETRY_SECONDS)
+            self._recording_failed = True
+            self._recording_retry_at = now + RECORDING_RETRY_SECONDS
+            return
+        if self._recording_failed:
+            log.info("the microphone started")
+        self._recording_media, self._recording_failed, self._recording_retry_at = media, False, 0.0
 
     def play_clip(self, path: Path, wait: bool = True) -> bool:
         """Play a WAV, blocking for its length; `wait=False` returns as soon as it is handed to the speaker.

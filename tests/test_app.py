@@ -345,4 +345,4 @@ def test_the_package_and_the_heartbeat_report_the_same_version():
     from medcare_reachy.bridge import __version__
 
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__ == "0.9.0"
+    assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__ == "0.9.1"

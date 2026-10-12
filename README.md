@@ -160,6 +160,7 @@ passed its Check. Otherwise check-ins work as before.
 
 ## Status
 
+- **0.9.1**: the robot app starts the microphone itself. Reachy Mini SDK 1.8.3 (the robot after a reset) never starts it, so every read was empty and neither 「我吃完了」 nor a check-in was heard.
 - **0.9.0**: multimodal emotion (face + voice + words) while a dose is watched, computed on the robot with a laptop
   fallback (above); the head follows the patient's face while a dose is watched (*Follow the patient's face*,
   `bridge/follow.py`: at most every 0.4 s, only when the face moved, still while a hand-to-mouth event is checked).
