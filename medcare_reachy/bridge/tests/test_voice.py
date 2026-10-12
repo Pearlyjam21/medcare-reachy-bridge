@@ -660,3 +660,72 @@ def test_lowering_priority_is_best_effort(monkeypatch):
     monkeypatch.setattr(voice_module.os, "PRIO_PROCESS", 0, raising=False)
     monkeypatch.setattr(voice_module.os, "setpriority", refuse, raising=False)
     assert voice_module.lower_thread_priority() is False
+
+
+# ── a live chat reads the microphone (suspend / resume) ──
+
+def test_a_suspended_listener_leaves_the_microphone_to_the_live_chat(tmp_path):
+    """Two readers would each get part of the sound: while suspended, the listener never calls get_audio()."""
+    voice, mic, vad, clock = chat_listener(tmp_path, ["我吃完了"])
+    voice.start()
+    try:
+        voice.set_active(True)
+        voice.suspend()
+        mic.chunks = [np.zeros(VAD_WINDOW * 4, np.float32)]
+        time.sleep(0.1)
+        assert len(mic.chunks) == 1 and vad.fed == 0          # left for the live chat
+        voice.resume()                                        # the chat's last sound may still echo ...
+        assert wait_for(lambda: not mic.chunks)
+        time.sleep(0.05)
+        assert vad.fed == 0 and voice.heard_since(0) is None   # ... so the tail after Reachy speaks applies
+        clock[0] = 100.0 + DONE_MUTE_TAIL_SECONDS
+        mic.chunks = [np.zeros(VAD_WINDOW * 4, np.float32)]
+        assert wait_for(lambda: voice.heard_since(0) == "吃完")
+    finally:
+        voice.stop()
+
+
+class SlowMic(Mic):
+    """A microphone whose read takes until `go` is set."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads, self.inside, self.go = 0, threading.Event(), threading.Event()
+
+    def get_audio(self):
+        self.reads += 1
+        self.inside.set()
+        self.go.wait(2)
+        return super().get_audio()
+
+
+def test_suspend_waits_for_a_microphone_read_in_progress(tmp_path):
+    for name in STT_FILES:
+        (tmp_path / name).write_bytes(b"x")
+    mic = SlowMic()
+    voice = DoneListener(mic, "zh-TW", tmp_path, load=lambda models_dir, language: (FakeVad(), lambda segment: ""))
+    voice.start()
+    try:
+        assert mic.inside.wait(2)                             # the listener is inside get_audio()
+        suspending = threading.Thread(target=voice.suspend)
+        suspending.start()
+        time.sleep(0.05)
+        assert suspending.is_alive()                          # suspend() waits for that read ...
+        mic.go.set()
+        suspending.join(2)
+        assert not suspending.is_alive()
+        reads = mic.reads
+        time.sleep(0.1)
+        assert mic.reads == reads                             # ... and no read follows it
+        voice.resume()
+        assert wait_for(lambda: mic.reads > reads)
+    finally:
+        voice.stop()
+
+
+def test_a_listener_that_never_started_suspends_at_once(tmp_path):
+    voice = DoneListener(Mic(), "zh-TW", tmp_path)            # no speech models: no thread
+    started = time.monotonic()
+    voice.suspend()
+    voice.resume()
+    assert time.monotonic() - started < 0.5

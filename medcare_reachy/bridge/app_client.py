@@ -9,6 +9,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 10.0
 METRICS_TIMEOUT = 3.0   # timings only: never keep a conversation waiting on them
+LIVE_PATH = "/api/device/conversations/live"   # the live chat's WebSocket (bridge/live.py)
 
 
 class BridgeError(Exception):
@@ -97,7 +98,8 @@ def _is_busy(detail) -> bool:
 class AppClient:
     def __init__(self, base_url: str, token: str, *, transport: httpx.AsyncBaseTransport | None = None,
                  clock=time.monotonic, timeout: float = DEFAULT_TIMEOUT):
-        self._http = httpx.AsyncClient(base_url=base_url.rstrip("/"), transport=transport, timeout=timeout,
+        self._base_url, self._token = base_url.rstrip("/"), token   # the live chat's WebSocket (live_url, auth_header)
+        self._http = httpx.AsyncClient(base_url=self._base_url, transport=transport, timeout=timeout,
                                        headers={"Authorization": f"Bearer {token}"})
         self._clock = clock
         # First failure time of the current outage; the slot session fails closed on it.
@@ -226,3 +228,14 @@ class AppClient:
     async def monitor_end(self, session_id: str, generation: str) -> dict | None:
         return await self._request("POST", "/api/device/monitor/end",
                                    json={"session_id": session_id, "generation": generation})
+
+    # ── live chat (a WebSocket of its own: bridge/live.py) ──────────────
+    def live_url(self) -> str:
+        """The live chat's WebSocket address on this client's server (the settings page takes only http:// and https://
+        addresses): ws:// for http://, wss:// for https://."""
+        scheme, _, rest = self._base_url.partition("://")
+        return f"{'wss' if scheme.lower() == 'https' else 'ws'}://{rest}{LIVE_PATH}"
+
+    def auth_header(self) -> dict:
+        """The robot key, as the live chat's WebSocket sends it (the HTTP calls carry it already)."""
+        return {"Authorization": f"Bearer {self._token}"}

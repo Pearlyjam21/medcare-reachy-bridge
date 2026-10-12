@@ -43,7 +43,8 @@ is downloaded at run time.
   the day's maximum reached, or missed too long ago), the robot says the server's one-sentence reason once and moves
   on to the next medicine. It never retries that dose in the same reminder.
 - Fails safe: stops and puts the robot to sleep if the server is unreachable or the robot key is revoked.
-- No microphone in this version.
+- Uses the microphone only while the patient's microphone consent is on: to hear 「我吃完了」 while a dose is
+  watched, and to talk in check-ins.
 - **Not a medical device.** Prototype software. Prompt wording is pending clinician review, and no voice clips are
   included yet, so the robot is silent until they're added.
 
@@ -102,8 +103,37 @@ above), but the companion can take it again at any time. Disable the companion a
 SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when another program took it, and
 `curl -s -X POST localhost:8000/api/media/acquire` gives it back.
 
+## Live voice check-ins (0.8.0, test)
+
+From 0.8.0 a check-in can be a live voice chat with OpenAI's GPT-Live, **for testing only**: no patient notice covers
+it yet. It runs only when the server allows it (`LIVE_VOICE_TEST=1` in the server's `.env`), the robot's "Live
+voice (test)" switch is on in the web app's Reachy card, and a live model on the web app's AI connections card has
+passed its Check. Otherwise check-ins work as before.
+
+- The robot sends what its microphone hears to the MedAiCarePlus server as it hears it, and plays the voice the server
+  sends back. The server talks with GPT-Live; the OpenAI key stays on the server.
+- Reachy no longer waits for its own speech-to-text (about 9 seconds a turn): GPT-Live answers by itself.
+- The server holds the start of every reply for half a second and can stop Reachy's voice at once. When the patient
+  talks about harming themselves, Reachy says the help line in its own voice and family are alerted, as in the text
+  chat.
+- While the chat runs, the server checks every 10 seconds that the robot is still paired and that the patient's
+  consents and live switch are still on. If not, the chat ends; when only the memory consent was switched off, the
+  check-in goes on as the text chat, without the notes.
+- When the server can't reach GPT-Live, or GPT-Live or the server fails during the chat, the check-in goes on as the
+  text chat. When OpenAI ends the session itself (its moderation), the server first judges the patient's last words:
+  the text chat takes over only when the safety check answers explicitly that there is no risk. Any other answer, or
+  none, counts as a risk: Reachy says the help line, family are alerted and the chat ends. When the robot's own
+  connection to the server drops, the server ends that chat and the robot starts a new text chat.
+- One sound owner: the app's speech listener pauses during the live chat, and Reachy's own lines go through the same
+  speaker queue as GPT-Live's voice.
+- It uses the `websockets` package, which the robot's apps environment already has.
+
 ## Status
 
+- **0.8.0** (for testing; not on this space yet): live voice check-ins (above). Without the server's live voice
+  switch, check-ins are unchanged.
+- **0.7.1**: today's check-in chat no longer ends when the patient is quiet (`CHECKIN_SILENCE = None`); it ends on a
+  goodbye, a risk, a stop, or after 5 minutes. Runs on the robot since 12 Oct 2026; not on this space yet.
 - **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
   about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
   Two quick restarts from the settings page no longer start two copies of the app's worker.

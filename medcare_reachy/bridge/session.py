@@ -18,8 +18,14 @@ patient's overdose protection refuses a dose (not due yet, too soon after the la
 day's maximum reached, or missed too long ago), Reachy says the server's one-sentence reason
 once and moves on to the next dose. It files nothing more: after "I finished" or a camera
 event, the server itself alerts family to a possible double dose.
+
+When the task says `live` (spec 2026-10-12 F2), the check-in is a live chat instead (`bridge/live.py`):
+the robot streams its microphone to the server's GPT-Live relay and plays the voice that comes back.
+The speech listener is suspended meanwhile (the microphone has one reader), and when the server
+falls back, today's chat goes on.
 """
 
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -36,8 +42,13 @@ WATCH_TIMEOUT = 180.0           # 3 min without an event -> help clip
 HELP_TIMEOUT = 180.0            # 3 more min -> leave the dose pending
 DONE_GRACE = 8.0                # after "I finished": time for the camera to resolve the dose first
 AWAY_TIMEOUT = 90.0             # patient out of sight this long while watched -> leave the dose pending
-CHECKIN_SILENCE = 25.0          # check-in: no answer this long after Reachy spoke -> say goodbye
-CHECKIN_MAX = 300.0             # check-in: at most 5 minutes
+CHECKIN_SILENCE: float | None = None   # check-in: off (0.7.1): a companion stays while the patient is quiet;
+                                       # seconds here end the chat that long after Reachy last spoke, unanswered
+CHECKIN_MAX = 300.0             # check-in: at most 5 minutes, then it ends as "finished"
+LIVE_POLL_SECONDS = 0.2         # live check-in: how often the session looks for a reason to stop it at once
+LIVE_STOP_SECONDS = 5.0         # live check-in: how long a stopped live chat may take to close
+LIVE_CHECKIN_MAX = 660.0        # live check-in: the robot's backstop (the server ends it after 600 s)
+LIVE_AUDIO = ("start_live_audio", "push_audio", "clear_live_audio", "stop_live_audio")   # media.py's live calls
 # Spoken (not prerecorded) greeting for a conversation-only task, already in the voice's Simplified characters.
 CHECKIN_GREETING = {"zh-TW": "您好！我来找您聊聊天。", "en": "Hello! I came to have a chat with you."}
 ACK_CLIP = "ack"                # check-in: the prerecorded 「嗯」 said the moment the patient pauses
@@ -83,9 +94,23 @@ def _parse_time(value) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def open_live_chat(app, robot, speaker):
+    """A LiveChat (bridge/live.py) when this robot app can hold one, else None (today's chat runs instead): the robot
+    has the live audio calls (media.py's ReachyRobot; not the video-file robot) and the live module loads (it needs
+    `websockets`, which the robot's apps_venv has)."""
+    if not all(callable(getattr(robot, name, None)) for name in LIVE_AUDIO):
+        return None
+    try:
+        from medcare_reachy.bridge.live import LiveChat
+    except ImportError as exc:
+        log.warning("live voice is off in this robot app: %s", exc)
+        return None
+    return LiveChat(app, robot, speaker)
+
+
 class SlotSession:
     def __init__(self, task: dict, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
-                 clock=None, run_blocking=_inline, ack=True, gestures=True):
+                 clock=None, run_blocking=_inline, ack=True, gestures=True, live_chat=open_live_chat):
         self.task = task
         self.task_id = task["task_id"]
         self.status = task.get("status") or "leased"
@@ -93,6 +118,7 @@ class SlotSession:
         self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
         self.speaker, self.language = speaker, language
         self.ack, self.gestures = ack, gestures
+        self.live_chat = live_chat               # (app, robot, speaker) -> a LiveChat, or None (open_live_chat)
         self.chat_id: str | None = None
         self.last_spoke = 0.0
         self.acked: float | None = None          # the patient's pause Reachy last said 「嗯」 to
@@ -406,23 +432,14 @@ class SlotSession:
 
         Each turn carries how long hearing it took, and each of Reachy's lines is followed by how long it took to
         arrive and to speak (milliseconds, for the patient's conversation history).
+
+        With `live` in the task it is a live chat instead (`_live_checkin`); today's chat runs when that falls back.
         """
         if not self.entered:
             self.entered = True
             await self._end_session()   # the camera isn't needed to chat
-            try:
-                opened = await self.app.conversation_start(self.task_id, self.language)
-            except (NotAuthorised, RequestRejected, SessionLost) as exc:
-                log.warning("slot %s: check-in unavailable (%s)", self.task_id, exc)
-                self.outcomes["checkin"] = "unavailable"
-                self._after_checkin()
-                return
-            self.chat_id = opened["conversation_id"]
-            await self._robot("hold_head")
-            stats: dict = {}
-            await self._say(opened.get("speech_text"), stats)
-            self.last_spoke = self.clock.monotonic()
-            await self._send_playback(opened.get("reply_turn_id"), stats)
+            if not (self._may_go_live() and await self._live_checkin()):
+                await self._open_chat()
             return
         if self.chat_id is None:
             self._after_checkin()
@@ -447,8 +464,104 @@ class SlotSession:
                 await self._close_chat("risk" if answer.get("risk") else "goodbye")
             return
         now = self.clock.monotonic()
-        if now - self.last_spoke >= CHECKIN_SILENCE or now - self.since >= CHECKIN_MAX:
+        if CHECKIN_SILENCE is not None and now - self.last_spoke >= CHECKIN_SILENCE:
             await self._close_chat("silence")
+        elif now - self.since >= CHECKIN_MAX:
+            await self._close_chat("finished")
+
+    async def _open_chat(self) -> None:
+        """Today's chat: POST /conversations, then Reachy's opening line."""
+        try:
+            opened = await self.app.conversation_start(self.task_id, self.language)
+        except (NotAuthorised, RequestRejected, SessionLost) as exc:
+            log.warning("slot %s: check-in unavailable (%s)", self.task_id, exc)
+            self.outcomes["checkin"] = "unavailable"
+            self._after_checkin()
+            return
+        self.chat_id = opened["conversation_id"]
+        await self._robot("hold_head")
+        stats: dict = {}
+        await self._say(opened.get("speech_text"), stats)
+        self.last_spoke = self.clock.monotonic()
+        await self._send_playback(opened.get("reply_turn_id"), stats)
+
+    async def _live_checkin(self) -> bool:
+        """The live chat (spec F2). False when this robot app can't hold one: today's chat runs instead.
+
+        One microphone reader: the speech listener is suspended for the whole chat and resumed after it, also when the
+        chat fails or is stopped. The server stores the conversation and ends it. On its `fallback`, today's chat goes
+        on: in the same conversation when the server already made one (Reachy says nothing new, it simply listens),
+        else in a new one; the silence and length limits then count from the fallback. A stop() wins over all of it.
+
+        outcomes["live"] says how the live chat went: "ended" (the server ended it; outcomes["checkin"] has its
+        reason), the fallback's reason, the robot's own reason to cut it short ("stopped", "microphone_withdrawn",
+        "too_long"), or "unsupported".
+        """
+        chat = self.live_chat(self.app, self.robot, self.speaker)
+        if chat is None:
+            self.outcomes["live"] = "unsupported"
+            return False
+        chat.gestures = self.gestures   # the settings page's check-in gestures switch (LiveChat reads it per block)
+        await self._robot("hold_head")
+        if self.voice is not None:
+            await self.run_blocking(self.voice.suspend)
+        try:
+            if self.stop_reason:   # stop() landed while the microphone was handed over: no chat
+                kind, reason, conversation_id = "cut", "stopped", None
+            else:
+                kind, reason, conversation_id = await self._run_live(chat)
+        finally:
+            if self.voice is not None:
+                self.voice.resume()
+        if self.stop_reason:
+            kind, reason = "cut", "stopped"
+        if kind == "fallback":
+            log.info("slot %s: the live chat fell back (%s); today's chat goes on", self.task_id, reason)
+            self.outcomes["live"] = reason
+            self.since = self.last_spoke = self.clock.monotonic()
+            if conversation_id:
+                self.chat_id = conversation_id
+            else:
+                await self._open_chat()
+            return True
+        self.outcomes["live"] = "ended" if kind == "ended" else reason
+        self.outcomes["checkin"] = reason
+        self._after_checkin()
+        return True
+
+    async def _run_live(self, chat) -> tuple[str, str, str | None]:
+        """Run the live chat to its end: (kind, reason, conversation_id), kind "ended" or "fallback" as its LiveOutcome
+        says. Every LIVE_POLL_SECONDS the session looks for a reason to stop it at once: stop() (the heartbeat's
+        stop_all, the app shutting down), the patient's microphone consent withdrawn (heartbeat), or the chat lasting
+        LIVE_CHECKIN_MAX. It is then cancelled: ("cut", that reason). A chat that fails: ("fallback", "error")."""
+        started = self.clock.monotonic()
+        run = asyncio.ensure_future(chat.run(self.task_id, self.language))
+        try:
+            while True:
+                done, _ = await asyncio.wait({run}, timeout=LIVE_POLL_SECONDS)
+                if done:
+                    break
+                if self.stop_reason:
+                    return "cut", "stopped", None
+                if not self.task.get("microphone"):
+                    log.warning("slot %s: microphone consent withdrawn; the live chat stops", self.task_id)
+                    return "cut", "microphone_withdrawn", None
+                if self.clock.monotonic() - started >= LIVE_CHECKIN_MAX:
+                    log.error("slot %s: the live chat outlasted %.0f s; the robot stops it", self.task_id,
+                              LIVE_CHECKIN_MAX)
+                    return "cut", "too_long", None
+        finally:
+            if not run.done():
+                run.cancel()
+                if not (await asyncio.wait({run}, timeout=LIVE_STOP_SECONDS))[0]:
+                    log.warning("slot %s: the live chat did not close within %.0f s", self.task_id,
+                                LIVE_STOP_SECONDS)
+        try:
+            outcome = run.result()
+        except Exception:
+            log.exception("slot %s: the live chat failed", self.task_id)
+            return "fallback", "error", None
+        return outcome.kind, outcome.reason, outcome.conversation_id
 
     async def _answer_pause(self) -> None:
         """The moment the VAD hears the patient pause, while SenseVoice is still decoding their words, Reachy says
@@ -642,6 +755,13 @@ class SlotSession:
         return (self.voice is not None and self.voice.available and self.speaker is not None
                 and self.speaker.available and bool(self.task.get("checkin")))
 
+    def _may_go_live(self) -> bool:
+        """A live chat needs the server's go-ahead (task["live"]: its test switch, the robot's live voice switch,
+        check-in consent and a usable live model), the patient's microphone consent, and Reachy's own voice: the
+        server has Reachy say the help line itself, never GPT-Live."""
+        return (bool(self.task.get("live")) and bool(self.task.get("microphone")) and self.speaker is not None
+                and self.speaker.available)
+
     async def _say(self, text: str | None, stats: dict | None = None, lively: bool = True) -> bool:
         """Speak a check-in line; `stats` receives the speaker's timings. In the conversation Reachy's antennas
         move from its first sound until it has finished (unless not `lively`: the help line after a risk is said
@@ -703,7 +823,7 @@ class SlotSession:
         fresh = {dose["intk_id"]: dose for dose in current.get("doses", [])}
         for dose in self.doses:
             dose.update(fresh.get(dose["intk_id"], {}))
-        for key in ("auto_record", "microphone", "checkin"):
+        for key in ("auto_record", "microphone", "checkin", "live"):
             if key in current:
                 self.task[key] = current[key]
         if current.get("expires_at"):

@@ -190,3 +190,32 @@ def test_say_tells_when_its_first_sound_is_about_to_play(tmp_path, monkeypatch):
 def test_say_with_nothing_to_say_reports_nothing(tmp_path):
     stats = {}
     assert Speaker(Robot(), tmp_path).say("你好", stats) is False and stats == {}
+
+
+def test_synth_gives_every_chunk_as_samples_and_plays_nothing(tmp_path, monkeypatch):
+    """The live chat plays Reachy's own lines through its own queue (bridge/live.py), never with play_clip."""
+    for name in speech.TTS_FILES:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(b"x")
+    tts, robot = SlowTTS(), Robot()
+    monkeypatch.setattr(speech, "_engine", None)
+    samples, rate = Speaker(robot, tmp_path, load=lambda models_dir: tts).synth("第一句。第二句。")
+    assert [text for _, text in tts.started] == ["第一句。", "第二句。"]
+    assert rate == 16000 and samples.dtype == np.float32 and len(samples) == 200   # 100 samples per chunk
+    assert robot.played == []
+
+
+def test_synth_without_a_voice_text_or_sound_gives_nothing(tmp_path, monkeypatch):
+    assert Speaker(Robot(), tmp_path).synth("你好") is None                         # no voice models
+    for name in speech.TTS_FILES:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(b"x")
+
+    class MuteTTS:
+        def generate(self, text, sid, speed):
+            return types.SimpleNamespace(samples=np.zeros(0, np.float32), sample_rate=22050)
+
+    monkeypatch.setattr(speech, "_engine", None)
+    speaker = Speaker(Robot(), tmp_path, load=lambda models_dir: MuteTTS())
+    assert speaker.synth("") is None and speaker.synth(None) is None
+    assert speaker.synth("你好。") is None

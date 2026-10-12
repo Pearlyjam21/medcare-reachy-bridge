@@ -93,6 +93,7 @@ ECHO_RATIO = 0.6                 # chat: this similar to what Reachy just said -
 ECHO_WINDOW = 1.5
 MODES = ("done", "chat")
 IDLE_SLEEP = 0.02
+SUSPEND_WAIT_SECONDS = 1.0       # suspend(): the longest it waits for a microphone read in progress to end
 LANGUAGE_CODES = {"zh-TW": "zh", "en": "en"}
 # Nice value of the listener thread and the decoder threads it starts: when the Pi is busy, speech yields to the
 # camera stream. On 2 Oct 2026, while a dose was watched, decoding the patient's "I finished" coincided with the
@@ -261,6 +262,9 @@ class DoneListener:
         if missing:
             log.warning("listening for 'I finished' is off: missing %s in %s", ", ".join(missing), self.models_dir)
         self._lock = threading.Lock()
+        self._read_done = threading.Condition(self._lock)   # notified when a microphone read ends (suspend)
+        self._suspended = False       # a live chat (live.py) reads the microphone: this thread leaves it alone
+        self._reading = False         # this thread is inside robot.get_audio()
         self._active = False
         self._holds = 0
         self._released_at = float("-inf")   # when the robot last stopped speaking (listening resumes after a tail)
@@ -305,6 +309,23 @@ class DoneListener:
                 self._think_at = None
             self._mode = mode
             self._active = bool(active) and self.available
+
+    def suspend(self) -> None:
+        """Stop reading the microphone until resume(): a live chat (live.py) is its one reader meanwhile (two readers
+        would each get part of its sound). Returns once this thread is not inside get_audio() any more, after at most
+        SUSPEND_WAIT_SECONDS. Speech half heard is forgotten, as when muted, and no thinking phrase is said."""
+        with self._lock:
+            self._suspended = True
+            self._think_at = None
+            if not self._read_done.wait_for(lambda: not self._reading, SUSPEND_WAIT_SECONDS):
+                log.warning("the listener's microphone read did not end within %.1f s", SUSPEND_WAIT_SECONDS)
+
+    def resume(self) -> None:
+        """The live chat is over: read the microphone again. Listening still follows set_active(), from the same tail
+        as after Reachy speaks (the chat's last sound may still be echoing)."""
+        with self._lock:
+            self._suspended = False
+            self._released_at = self.clock()
 
     def hold(self) -> None:
         with self._lock:
@@ -446,7 +467,21 @@ class DoneListener:
         with self._lock:
             # The tail follows the current mode: the "say when done" prompt is released before watching starts.
             tail = MUTE_TAIL_SECONDS if self._mode == "chat" else DONE_MUTE_TAIL_SECONDS
-            return self._active and self._holds == 0 and self.clock() >= self._released_at + tail
+            return (self._active and not self._suspended and self._holds == 0
+                    and self.clock() >= self._released_at + tail)
+
+    def _read(self) -> tuple[np.ndarray, int] | None:
+        """Worker: the microphone's next chunk, or None while suspended, without touching the microphone."""
+        with self._lock:
+            if self._suspended:
+                return None
+            self._reading = True
+        try:
+            return self.robot.get_audio()
+        finally:
+            with self._lock:
+                self._reading = False
+                self._read_done.notify_all()
 
     def _run(self) -> None:
         lower_thread_priority()   # before loading: model worker threads inherit the lower priority
@@ -461,7 +496,7 @@ class DoneListener:
         fed = 0   # samples fed to the VAD since its last reset: what its segments' start counts in
         mic = _MicClock()   # when each of those samples was heard
         while not self._stop.is_set():
-            chunk = self.robot.get_audio()
+            chunk = self._read()
             if not self._listening():
                 if dirty:   # forget half-heard speech from before a pause or from our own prompt
                     vad.reset()

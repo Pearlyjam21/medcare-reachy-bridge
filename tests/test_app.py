@@ -335,3 +335,14 @@ def test_server_vision_runs_without_the_vision_models(tmp_path):
         assert wait_for(lambda: service.status()["state"] == "running")
     finally:
         service.stop()
+
+
+# ── version ──
+def test_the_package_and_the_heartbeat_report_the_same_version():
+    """The app store installs pyproject's version; heartbeats report bridge.__version__ (spec 2026-10-12 F3)."""
+    import tomllib
+
+    from medcare_reachy.bridge import __version__
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__ == "0.8.0"

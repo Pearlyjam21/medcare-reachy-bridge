@@ -38,6 +38,10 @@ RECENTER_LIMIT = {"head_deg": 15.0, "head_mm": 20.0, "body_deg": 8.0, "antenna_d
 DAEMON_PORT = 8000
 MEDIA_STATUS_TIMEOUT = 2.0   # seconds: the camera watchdog logs the daemon's media status with every stall
 RESTORE_RETRY_SECONDS = 60.0   # restore_media(): while the daemon refuses, ask again at most this often
+LIVE_RATE = 16000   # the live chat's audio (bridge/live.py): the robot's own rate, so the SDK needs no resampling
+# stop_live_audio(): the SDK still plays what the live chat pushed last, about 0.17 s through its pipeline plus its
+# 50 ms sink buffer (audio_gstreamer.py PLAYBACK_SINK_BUFFER_TIME_US); the next clip waits that out.
+LIVE_TAIL_SECONDS = 0.3
 
 
 class Robot(Protocol):
@@ -53,6 +57,11 @@ class Robot(Protocol):
     def is_reachable(self) -> bool: ...
     def restore_media(self) -> bool: ...   # ask for released media back (speaker, microphone, camera); never raises
     def gesture(self, mode: str | None) -> None: ...   # check-in body language: "think", "speak", None (still)
+    # The live chat (bridge/live.py) owns the speaker from start_live_audio() to stop_live_audio(); no clip plays then.
+    def start_live_audio(self) -> bool: ...   # False: no speaker now
+    def push_audio(self, samples: np.ndarray) -> bool: ...   # one block, float32 mono at LIVE_RATE, not waited for
+    def clear_live_audio(self) -> None: ...   # drop what the speaker still has queued
+    def stop_live_audio(self) -> None: ...
 
 
 def crop_4_3(frame: np.ndarray) -> np.ndarray:
@@ -237,6 +246,47 @@ class ReachyRobot:
             # Playback is asynchronous in the SDK; keep the robot quiet for the clip's length.
             time.sleep(seconds)
         return True
+
+    # ── the live chat's speaker (bridge/live.py) ─────────────────────────
+    def start_live_audio(self) -> bool:
+        """Start the speaker for a live chat, which owns it until stop_live_audio(): the SDK's start_playing() once,
+        after any clip still playing, then push_audio() blocks paced by the chat. False when this app has no media."""
+        with self._lock:
+            time.sleep(max(0.0, self._quiet_at - time.monotonic()))   # never cut a clip short
+            media = self._media()
+            if media is None:
+                return False
+            media.start_playing()
+        return True
+
+    def push_audio(self, samples: np.ndarray) -> bool:
+        """One block of the live chat's audio (float32 mono at LIVE_RATE), handed to the speaker without waiting: the
+        SDK plays pushed blocks back to back, so the caller paces them. False when this app has no media."""
+        with self._lock:
+            media = self._media()
+            if media is None:
+                return False
+            samples = np.asarray(samples, dtype=np.float32)
+            out_rate = int(media.get_output_audio_samplerate())
+            media.push_audio_sample(resample(samples, LIVE_RATE, out_rate))   # 16 kHz on the robot: no change
+        return True
+
+    def clear_live_audio(self) -> None:
+        """Drop what the speaker still has queued (the live chat's flush), with the SDK's clear_player(). In reachy_mini
+        1.11.0 that call is on the media manager's audio object (the manager has none): GStreamerAudio pauses its one
+        pipeline, flushes the player and plays again. Does nothing without media."""
+        with self._lock:
+            media = self._media()
+            clear = getattr(getattr(media, "audio", None), "clear_player", None)
+            if clear is not None:
+                clear()
+
+    def stop_live_audio(self) -> None:
+        """The live chat is over. Never the SDK's stop_playing(): GStreamerAudio keeps the microphone and the speaker in
+        one pipeline, which stop_playing() sets to NULL, and the speech listener would then hear nothing. The next clip
+        starts the playback itself (play_clip) and waits LIVE_TAIL_SECONDS for the audio the chat pushed last."""
+        with self._lock:
+            self._quiet_at = max(self._quiet_at, time.monotonic() + LIVE_TAIL_SECONDS)
 
     def media_status(self) -> dict | None:
         """The daemon's GET /api/media/status ({"available", "released", "no_media"}), or None on any error."""
@@ -484,6 +534,18 @@ class VideoFileRobot:
         self.actions.append(("play_clip", Path(path).name))
         log.info("[video robot] play %s", path)
         return True
+
+    def start_live_audio(self) -> bool:
+        return False   # no microphone to stream: a live chat falls back to the text chat
+
+    def push_audio(self, samples: np.ndarray) -> bool:
+        return False
+
+    def clear_live_audio(self) -> None:
+        pass
+
+    def stop_live_audio(self) -> None:
+        pass
 
     def gesture(self, mode: str | None) -> None:
         self.actions.append(("gesture", mode))
