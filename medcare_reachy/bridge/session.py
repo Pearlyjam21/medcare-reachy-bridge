@@ -88,9 +88,10 @@ def _parse_time(value) -> datetime | None:
 
 class SlotSession:
     def __init__(self, task: dict, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
-                 clock=None, run_blocking=_inline, ack=True, gestures=True, mood=None):
+                 clock=None, run_blocking=_inline, ack=True, gestures=True, mood=None, follow=None):
         self.task = task
         self.mood = mood   # multimodal emotion for the dose being watched (begin/end/summary), or None
+        self.follow = follow   # follow.FaceFollower: the head keeps the verified face centred while a dose is watched
         self.task_id = task["task_id"]
         self.status = task.get("status") or "leased"
         self.doses = [dict(dose) for dose in task.get("doses", [])]
@@ -306,6 +307,7 @@ class SlotSession:
         latest = self._latest()
         now = self.clock.monotonic()
         self._note_done(now)
+        await self._follow_face(latest, now)
         recorded = latest.get("recorded")
         if recorded and recorded.get("status", "taken") == "taken":
             self.outcomes[dose["intk_id"]] = "recorded"
@@ -563,6 +565,7 @@ class SlotSession:
     def _go(self, state: str) -> None:
         log.info("slot %s: %s -> %s", self.task_id, self.state, state)
         self._sync_mood(state)
+        self._sync_follow(state)
         self.state = state
         self.since = self.clock.monotonic()
         self.entered = False
@@ -583,6 +586,7 @@ class SlotSession:
     def _finish(self, result: str) -> None:
         log.info("slot %s finished: %s %s", self.task_id, result, self.outcomes)
         self._sync_mood(SLEEP)
+        self._sync_follow(SLEEP)
         self.result = result
         self.done = True
         self.state = SLEEP
@@ -678,6 +682,22 @@ class SlotSession:
                 self.mood.end()
         except Exception:   # a soft cue, never the dose's flow
             log.exception("mood tracking failed")
+
+    def _sync_follow(self, state: str) -> None:
+        if self.follow is None:
+            return
+        if state == WATCHING and self.state != WATCHING:
+            self.follow.start()
+        elif state != WATCHING and self.state == WATCHING:
+            self.follow.stop()
+
+    async def _follow_face(self, latest: dict, now: float) -> None:
+        """Keep the head on the verified face (the server's target_box); nothing while a candidate event is being
+        verified, so the hand-to-mouth detector works on a still camera."""
+        if self.follow is None or latest.get("candidate"):
+            return
+        box = latest.get("target_box") if latest.get("identity_status") == "verified" else None
+        await self.run_blocking(self.follow.update, box, now)
 
     def _mood_evidence(self) -> dict:
         if self.mood is None:

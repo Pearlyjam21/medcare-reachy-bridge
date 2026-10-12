@@ -11,7 +11,7 @@ from medcare_reachy.bridge.multimodal.governor import MODES as EMOTION_COMPUTE_M
 DEFAULT_PATH = Path.home() / ".medcare_reachy" / "settings.json"
 DEFAULTS = {"app_url": "", "device_token": "", "language": "zh-TW", "capture_fps": 15.0, "vision_on_server": True,
             "checkin_ack": True, "checkin_gestures": True, "multimodal_emotion": True,
-            "emotion_compute": "auto"}
+            "emotion_compute": "auto", "follow_face": True}
 # The server records doses automatically only at >= 12 fps. Computing landmarks on the robot reaches ~3 fps, so by
 # default the robot only streams frames and the server computes them (vision_on_server).
 MAX_FPS = 15.0
@@ -21,7 +21,8 @@ MAX_FPS = 15.0
 # Either can be switched off here.
 # Multimodal emotion while a dose is watched (face + voice + words, multimodal_emotion) and where it is computed:
 # "auto" (the robot, falling back to the laptop when it can't keep up), "robot" or "laptop" (emotion_compute).
-SWITCHES = ("vision_on_server", "checkin_ack", "checkin_gestures", "multimodal_emotion")
+# follow_face: while a dose is watched the head keeps the verified patient's face centred (bridge/follow.py).
+SWITCHES = ("vision_on_server", "checkin_ack", "checkin_gestures", "multimodal_emotion", "follow_face")
 
 
 class SettingsError(ValueError):

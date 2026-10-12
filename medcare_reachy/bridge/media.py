@@ -48,6 +48,7 @@ class Robot(Protocol):
     def set_head(self, pose: np.ndarray) -> None: ...
     def hold_head(self) -> None: ...
     def look_around(self, step: int) -> None: ...
+    def look_at(self, u: float, v: float, duration: float) -> None: ...   # face centre in the streamed frame (0-1)
     def wake(self) -> None: ...
     def sleep(self) -> None: ...
     def is_reachable(self) -> bool: ...
@@ -429,6 +430,23 @@ class ReachyRobot:
     def look_around(self, step: int) -> None:
         self.set_head(head_pose(SCAN_YAWS_DEG[step % len(SCAN_YAWS_DEG)], pitch_deg=-5), duration=1.5)
 
+    def look_at(self, u: float, v: float, duration: float = 0.35) -> None:
+        """Turn the head towards a point of the streamed frame (normalised 0-1, see runner.encode_stream_jpeg):
+        the server's face box is in that 4:3 centre crop, the SDK's look_at_image wants a pixel of the camera's
+        own image."""
+        media = self._media()
+        if self._mini is None or media is None:
+            return
+        camera = getattr(media, "camera", None)
+        width, height = (getattr(camera, "resolution", None) or (1280, 720))[:2]
+        crop_width = min(width, int(height * 4 / 3))
+        x0 = (width - crop_width) // 2
+        px = int(round(x0 + min(1.0, max(0.0, u)) * crop_width))
+        py = int(round(min(1.0, max(0.0, v)) * height))
+        px, py = min(width - 1, max(1, px)), min(height - 1, max(1, py))
+        self._gestures.halt()
+        self._mini.look_at_image(px, py, duration=duration)
+
     def wake(self) -> None:
         if self._mini is None:
             return
@@ -496,6 +514,9 @@ class VideoFileRobot:
 
     def look_around(self, step: int) -> None:
         self.actions.append(("look_around", step))
+
+    def look_at(self, u: float, v: float, duration: float = 0.35) -> None:
+        self.actions.append(("look_at", round(u, 2), round(v, 2)))
 
     def wake(self) -> None:
         self.actions.append(("wake",))

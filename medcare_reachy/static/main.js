@@ -82,6 +82,9 @@ async function loadConfig() {
   form.capture_fps.value = config.capture_fps;
   form.checkin_ack.checked = config.checkin_ack !== false;
   form.checkin_gestures.checked = config.checkin_gestures !== false;
+  form.multimodal_emotion.checked = config.multimodal_emotion !== false;
+  form.follow_face.checked = config.follow_face !== false;
+  form.emotion_compute.value = config.emotion_compute || "auto";
   document.getElementById("token-hint").textContent = config.device_token_set
     ? "A robot key is saved. Leave empty to keep it, or paste a new one."
     : "Shown once when you pair the robot in the web app.";
@@ -96,6 +99,9 @@ form.addEventListener("submit", oneAtATime(async () => {
     capture_fps: Number(form.capture_fps.value),
     checkin_ack: form.checkin_ack.checked,
     checkin_gestures: form.checkin_gestures.checked,
+    multimodal_emotion: form.multimodal_emotion.checked,
+    follow_face: form.follow_face.checked,
+    emotion_compute: form.emotion_compute.value,
     multimodal_emotion: form.multimodal_emotion.checked,
     emotion_compute: form.emotion_compute.value,
   };

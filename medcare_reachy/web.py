@@ -14,6 +14,7 @@ class ConfigUpdate(BaseModel):
     checkin_ack: bool | None = None
     checkin_gestures: bool | None = None
     multimodal_emotion: bool | None = None
+    follow_face: bool | None = None
     emotion_compute: str | None = None
 
 

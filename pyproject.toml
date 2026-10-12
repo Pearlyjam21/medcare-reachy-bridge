@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "medcare_reachy"
-version = "0.7.0"
+version = "0.8.0"
 description = "Medication-time companion for Reachy Mini: reminds, prompts each medicine, and watches each dose (intake and emotion) on the robot itself, for a MedAiCarePlus server."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ dependencies = [
     # Multimodal emotion while a dose is watched (bridge/multimodal): the voice and Chinese text models come from
     # the Hugging Face Hub with the machine's `hf auth login`; the text model needs the fast tokenizer and the
     # Simplified -> Traditional converter it was trained with. The face model is the bundled emotion_seed43.onnx.
+    "sherpa-onnx>=1.12",   # silero VAD for the 'I finished' listener (bridge/voice.py); not on a fresh image
     "huggingface_hub",
     "tokenizers>=0.19",
     "chinese-converter>=1.0",

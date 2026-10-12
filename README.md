@@ -135,7 +135,10 @@ SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when ano
 ## Status
 
 - **0.8.0**: multimodal emotion (face + voice + words) while a dose is watched, computed on the robot with a laptop
-  fallback (above). New settings: *Sense emotion…* and *Where emotion is computed*.
+  fallback (above); the head follows the patient's face while a dose is watched (*Follow the patient's face*,
+  `bridge/follow.py`: at most every 0.4 s, only when the face moved, still while a hand-to-mouth event is checked).
+  New settings: *Sense emotion…*, *Where emotion is computed*, *Follow the patient's face*. `sherpa-onnx` is now a
+  declared dependency (a fresh robot image lacks it, and without it the robot never hears 「我吃完了」).
 - **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
   about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
   Two quick restarts from the settings page no longer start two copies of the app's worker.

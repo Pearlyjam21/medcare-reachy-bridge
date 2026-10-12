@@ -49,6 +49,9 @@ class FakeRobot:
     def hold_head(self):
         self.calls.append("hold_head")
 
+    def look_at(self, u, v, duration=0.35):
+        self.calls.append(f"look_at:{u:.2f},{v:.2f}")
+
     def look_around(self, step):
         self.calls.append(f"look_around:{step}")
 

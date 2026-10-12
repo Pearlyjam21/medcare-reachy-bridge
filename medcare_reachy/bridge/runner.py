@@ -481,9 +481,9 @@ class MonitorStream:
 class Runner:
     def __init__(self, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
                  heartbeat_seconds=HEARTBEAT_SECONDS, tick_seconds=TICK_SECONDS, run_blocking=asyncio.to_thread,
-                 ack=True, gestures=True, mood=None):
+                 ack=True, gestures=True, mood=None, follow=None):
         self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
-        self.speaker, self.language, self.mood = speaker, language, mood
+        self.speaker, self.language, self.mood, self.follow = speaker, language, mood, follow
         self.ack, self.gestures = ack, gestures   # check-in 「嗯」 and body language (SlotSession)
         self.heartbeat_seconds = heartbeat_seconds
         self.tick_seconds = tick_seconds
@@ -552,7 +552,8 @@ class Runner:
         log.info("task %s (%s): %d dose(s)", task.get("task_id"), task.get("reason"), len(task.get("doses", [])))
         slot = SlotSession(task, app=self.app, robot=self.robot, clips=self.clips, stream=self.stream,
                            voice=self.voice, speaker=self.speaker, language=self.language,
-                           run_blocking=self.run_blocking, ack=self.ack, gestures=self.gestures, mood=self.mood)
+                           run_blocking=self.run_blocking, ack=self.ack, gestures=self.gestures, mood=self.mood,
+                           follow=self.follow)
         self.slot = slot
         if self.stopping.is_set():
             slot.stop("bridge_shutdown", abort=False)
