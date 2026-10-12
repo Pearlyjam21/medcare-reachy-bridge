@@ -10,6 +10,9 @@ current, `voice` listens for the patient saying they have finished. Saying so is
 evidence: if the camera does not resolve the dose within DONE_GRACE, it goes to caregiver
 confirmation as `patient_claim`.
 
+While a dose is watched, `mood` (multimodal emotion, optional) is told when the watching starts and ends and
+what it saw and heard goes into the dose's confirmation evidence ("emotion").
+
 In a check-in conversation Reachy says 「嗯」 the moment the patient pauses (`ack`) and moves
 while it prepares and speaks its reply (`gestures`); either can be turned off in the settings.
 
@@ -85,8 +88,9 @@ def _parse_time(value) -> datetime | None:
 
 class SlotSession:
     def __init__(self, task: dict, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
-                 clock=None, run_blocking=_inline, ack=True, gestures=True):
+                 clock=None, run_blocking=_inline, ack=True, gestures=True, mood=None):
         self.task = task
+        self.mood = mood   # multimodal emotion for the dose being watched (begin/end/summary), or None
         self.task_id = task["task_id"]
         self.status = task.get("status") or "leased"
         self.doses = [dict(dose) for dose in task.get("doses", [])]
@@ -335,13 +339,14 @@ class SlotSession:
         evidence = {"event_id": candidate.get("event_id"), "decision": candidate.get("decision"),
                     "confidence": candidate.get("confidence"), "frame_seq": candidate.get("frame_seq"),
                     "degraded": bool(latest.get("degraded")), "landmark_fps": latest.get("landmark_fps"),
-                    "said_done": self.done_at is not None}
+                    "said_done": self.done_at is not None, **self._mood_evidence()}
         await self._confirm(dose, source, evidence)
 
     async def _patient_claim(self, dose: dict, latest: dict):
         """Heard "I finished" but the camera resolved nothing: a caregiver checks the pill box."""
         evidence = {"said_done": True, "phrase": self.done_word, "camera": "no_event",
-                    "degraded": bool(latest.get("degraded")), "landmark_fps": latest.get("landmark_fps")}
+                    "degraded": bool(latest.get("degraded")), "landmark_fps": latest.get("landmark_fps"),
+                    **self._mood_evidence()}
         await self._confirm(dose, "patient_claim", evidence)
 
     async def _confirm(self, dose: dict, source: str, evidence: dict):
@@ -557,6 +562,7 @@ class SlotSession:
     # ── helpers ──────────────────────────────────────────────────────────
     def _go(self, state: str) -> None:
         log.info("slot %s: %s -> %s", self.task_id, self.state, state)
+        self._sync_mood(state)
         self.state = state
         self.since = self.clock.monotonic()
         self.entered = False
@@ -576,6 +582,7 @@ class SlotSession:
 
     def _finish(self, result: str) -> None:
         log.info("slot %s finished: %s %s", self.task_id, result, self.outcomes)
+        self._sync_mood(SLEEP)
         self.result = result
         self.done = True
         self.state = SLEEP
@@ -659,6 +666,31 @@ class SlotSession:
                                           (lambda: self._gesture("speak")) if lively else None))
         finally:
             self._gesture(None)
+
+    def _sync_mood(self, state: str) -> None:
+        """Emotion samples count towards the dose only from the prompt until it is resolved or left."""
+        if self.mood is None:
+            return
+        try:
+            if state == WATCHING and self.state != WATCHING:
+                self.mood.begin(self.doses[self.index]["intk_id"] if self.index < len(self.doses) else None)
+            elif state != WATCHING and self.state == WATCHING:
+                self.mood.end()
+        except Exception:   # a soft cue, never the dose's flow
+            log.exception("mood tracking failed")
+
+    def _mood_evidence(self) -> dict:
+        if self.mood is None:
+            return {}
+        try:
+            summary = self.mood.summary()
+        except Exception:
+            log.exception("mood summary failed")
+            return {}
+        compute = getattr(self.stream, "emotion_compute", None)
+        if callable(compute):
+            summary = {**summary, "compute": compute()}
+        return {"emotion": summary}
 
     def _sync_voice(self) -> None:
         if self.voice is None:

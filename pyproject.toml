@@ -18,6 +18,12 @@ dependencies = [
     "numpy",
     "httpx>=0.27",
     "faster-whisper>=1.1,<2",
+    # Multimodal emotion while a dose is watched (bridge/multimodal): the voice and Chinese text models come from
+    # the Hugging Face Hub with the machine's `hf auth login`; the text model needs the fast tokenizer and the
+    # Simplified -> Traditional converter it was trained with. The face model is the bundled emotion_seed43.onnx.
+    "huggingface_hub",
+    "tokenizers>=0.19",
+    "chinese-converter>=1.0",
 ]
 keywords = ["reachy-mini-app"]
 

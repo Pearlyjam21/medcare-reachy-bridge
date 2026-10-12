@@ -252,10 +252,13 @@ class DoneListener:
     """
 
     def __init__(self, robot, language: str = "zh-TW", models_dir: Path = STT_DIR, *, clock=time.monotonic,
-                 load=_speech_models, think_aloud=None, spawn=_in_thread):
+                 load=_speech_models, think_aloud=None, spawn=_in_thread, on_segment=None):
         self.robot, self.language, self.models_dir = robot, language, Path(models_dir)
         self.clock, self._load = clock, load
         self.think_aloud, self._spawn = think_aloud, spawn
+        # Each decoded speech segment, as (samples, began, ended, text), on this thread: the multimodal emotion
+        # engine scores the voice and the words from it. It never raises into the listener.
+        self.on_segment = on_segment
         missing = [name for name in STT_FILES if not (self.models_dir / name).is_file()]
         self.available = not missing
         if missing:
@@ -514,6 +517,11 @@ class DoneListener:
                 decode_from = self.clock()
                 text = transcribe(segment)
                 decode = self.clock() - decode_from
+                if self.on_segment is not None and self._listening():
+                    try:
+                        self.on_segment(segment, began, ended, text)
+                    except Exception:
+                        log.exception("segment listener failed")
                 if not self._listening():
                     with self._lock:
                         if not self._segments:

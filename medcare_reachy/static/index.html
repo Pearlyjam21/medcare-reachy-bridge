@@ -53,6 +53,20 @@
             <small>In a check-in chat, Reachy tilts its head, turns slowly and moves its antennas while it prepares a reply, and moves its antennas while it speaks.</small>
           </span>
         </label>
+        <label class="check">
+          <input name="multimodal_emotion" type="checkbox" checked>
+          <span>Sense emotion from face, voice and words while a dose is watched
+            <small>The patient's expression, tone of voice and (in Chinese) words are combined into one emotion for the dose. Voice and words need the microphone consent; the models come from Hugging Face on first start.</small>
+          </span>
+        </label>
+        <label>Where emotion is computed
+          <select name="emotion_compute">
+            <option value="auto">On the robot, laptop as fallback</option>
+            <option value="robot">Always on the robot</option>
+            <option value="laptop">Always on the laptop (server)</option>
+          </select>
+          <small>With the fallback, the robot hands over when it scores fewer than half the frames due, takes over half a second per score three times in a row, or fails three times; it tries again after a minute. On the laptop the robot only streams its camera.</small>
+        </label>
         <button type="submit">Save and connect</button>
         <p id="form-error" class="error" role="alert"></p>
       </form>

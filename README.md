@@ -63,6 +63,36 @@ Checked against the real MediaPipe on its sample images: face points within 1–
 within 5–8 px. On a moving clip the error is under 1 px, with the same frame-to-frame jitter
 (`tests/test_vision_accuracy.py`, `tools/MODELS.md`).
 
+## Emotion while a dose is watched (0.8.0)
+
+From the prompt until the dose is resolved or left, the robot senses the patient's emotion from three things, the
+way the [Reachy Mini Multimodal Emotion](https://huggingface.co/spaces/pearlyjam21/reachy_mini_multimodal_emotion)
+app does: the **face** (the bundled `emotion_seed43` model, which is that app's FER+ MobileNetV3, on the face the
+server verified, never with a hand at the mouth), the **voice** (its acoustic model, on each sentence the
+"I finished" listener cuts; needs the microphone consent) and the **words** (its Traditional Chinese text model, on
+the listener's transcript; left out for English). The three are fused with the weights from
+[`pearlyjam21/multimodal-emotion-zh`](https://huggingface.co/pearlyjam21/multimodal-emotion-zh) (text 0.9, face 0.5,
+voice 0.3); a modality without fresh evidence is left out, never counted as "neutral". The engine is in
+`medcare_reachy/bridge/multimodal/` (`labels`, `fusion`, `speech` and `text` are the Space's own modules).
+
+- The voice and text models (about 110 MB) are fetched from the Hub on first start with the robot's existing Hugging
+  Face login (`hf auth login`, or `HF_TOKEN`), then reused from the cache. If they can't be had, emotion runs on the
+  face alone and the log says so. `MULTIMODAL_MODELS_DIR` points at a local copy instead.
+- What the server receives keeps its contract: with on-robot landmarks the score rides on the landmark packet as
+  before; with streamed frames it goes along as an `emotion` form field of `/monitor/frame` (servers before the
+  multimodal update ignore it). A dose watched in silence is reported exactly as 0.3.0 did (the face model's own
+  softmax); only when a second modality is present are the fused probabilities sent.
+- The dose's summary (average fused emotion, how many face, voice and text samples, which branches were on, where it
+  was computed) is filed with the dose's confirmation evidence under `emotion`.
+
+**Where it is computed.** By default on the robot (`emotion_compute: auto`). The governor
+(`multimodal/governor.py`) hands over to the laptop when the robot scored fewer than half the frames due in the last
+10 s, took over 0.5 s three times in a row, or failed three times in a row; the robot then only streams its camera
+(even when it computes landmarks itself) and the server scores the frames with its own copy of the face model. After
+60 s the robot is tried again. The settings page shows where emotion runs, the branches in use, the rate and the
+reason for a fallback; "robot" and "laptop" pin the choice. Voice and words have no laptop path: a branch that fails
+three times in a row is switched off for the session.
+
 ### Is the robot fast enough?
 
 To keep up on a Pi, the detectors run every 3rd frame and pose every 2nd frame, and the three models run on separate
@@ -104,6 +134,8 @@ SSH: `curl -s localhost:8000/api/media/status` shows `"released": true` when ano
 
 ## Status
 
+- **0.8.0**: multimodal emotion (face + voice + words) while a dose is watched, computed on the robot with a laptop
+  fallback (above). New settings: *Sense emotion…* and *Where emotion is computed*.
 - **0.7.0**: a camera watchdog (above): a stalled camera is recovered, or the search ends with `camera_unavailable`
   about 17 seconds after the last frame instead of searching for 10 minutes. The heartbeat reports the camera state.
   Two quick restarts from the settings page no longer start two copies of the app's worker.

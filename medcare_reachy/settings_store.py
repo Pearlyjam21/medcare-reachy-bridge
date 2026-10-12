@@ -6,10 +6,12 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from medcare_reachy.bridge.config import LANGUAGES
+from medcare_reachy.bridge.multimodal.governor import MODES as EMOTION_COMPUTE_MODES
 
 DEFAULT_PATH = Path.home() / ".medcare_reachy" / "settings.json"
 DEFAULTS = {"app_url": "", "device_token": "", "language": "zh-TW", "capture_fps": 15.0, "vision_on_server": True,
-            "checkin_ack": True, "checkin_gestures": True}
+            "checkin_ack": True, "checkin_gestures": True, "multimodal_emotion": True,
+            "emotion_compute": "auto"}
 # The server records doses automatically only at >= 12 fps. Computing landmarks on the robot reaches ~3 fps, so by
 # default the robot only streams frames and the server computes them (vision_on_server).
 MAX_FPS = 15.0
@@ -17,7 +19,9 @@ MAX_FPS = 15.0
 # once their words are in (checkin_ack), and moves its antennas, head and body while it prepares and speaks a reply
 # (checkin_gestures).
 # Either can be switched off here.
-SWITCHES = ("vision_on_server", "checkin_ack", "checkin_gestures")
+# Multimodal emotion while a dose is watched (face + voice + words, multimodal_emotion) and where it is computed:
+# "auto" (the robot, falling back to the laptop when it can't keep up), "robot" or "laptop" (emotion_compute).
+SWITCHES = ("vision_on_server", "checkin_ack", "checkin_gestures", "multimodal_emotion")
 
 
 class SettingsError(ValueError):
@@ -37,7 +41,7 @@ class SettingsStore:
 
     def save(self, update: dict) -> dict:
         settings = self.load()
-        for key in ("app_url", "language", "capture_fps", *SWITCHES):
+        for key in ("app_url", "language", "capture_fps", "emotion_compute", *SWITCHES):
             if key in update and update[key] is not None:
                 settings[key] = update[key]
         # The key is write-only: an empty field on the form means "keep the current key".
@@ -80,12 +84,16 @@ def validate(settings: dict) -> dict:
     for key in SWITCHES:
         if not isinstance(settings[key], bool):
             raise SettingsError(f"{key} must be true or false")
+    compute = str(settings.get("emotion_compute", DEFAULTS["emotion_compute"])).strip().lower()
+    if compute not in EMOTION_COMPUTE_MODES:
+        raise SettingsError(f"Emotion compute must be one of {', '.join(EMOTION_COMPUTE_MODES)}")
     return {"app_url": url, "device_token": token, "language": settings["language"], "capture_fps": fps,
-            **{key: settings[key] for key in SWITCHES}}
+            "emotion_compute": compute, **{key: settings[key] for key in SWITCHES}}
 
 
 def public_view(settings: dict) -> dict:
     """Never send the key back to the browser; only whether one is set."""
     return {"app_url": settings["app_url"], "language": settings["language"],
             "capture_fps": settings["capture_fps"], **{key: settings.get(key, True) for key in SWITCHES},
+            "emotion_compute": settings.get("emotion_compute", DEFAULTS["emotion_compute"]),
             "device_token_set": bool(settings["device_token"])}

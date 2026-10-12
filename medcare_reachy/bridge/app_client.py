@@ -1,5 +1,6 @@
 """Async client for the app's private device API (/api/device/*, port 8001)."""
 
+import json
 import logging
 import time
 
@@ -189,12 +190,18 @@ class AppClient:
             files={"file": ("frame.jpg", jpeg, "image/jpeg")})
 
     async def monitor_frame(self, session_id: str, generation: str, frame_seq: int, timestamp: float,
-                            jpeg: bytes) -> dict:
-        """A camera frame for the server to compute the landmarks of (`timestamp`: capture time, seconds)."""
+                            jpeg: bytes, emotion: dict | None = None) -> dict:
+        """A camera frame for the server to compute the landmarks of (`timestamp`: capture time, seconds).
+
+        `emotion`: the robot's own multimodal score of the verified face on a recent frame ({"probabilities",
+        "target_box", "timestamp"}), as a JSON form field. Servers before the multimodal update ignore it.
+        """
+        data = {"session_id": session_id, "generation": generation, "frame_seq": str(frame_seq),
+                "timestamp": repr(float(timestamp))}
+        if emotion is not None:
+            data["emotion"] = json.dumps(emotion)
         return await self._request(
-            "POST", "/api/device/monitor/frame",
-            data={"session_id": session_id, "generation": generation, "frame_seq": str(frame_seq),
-                  "timestamp": repr(float(timestamp))},
+            "POST", "/api/device/monitor/frame", data=data,
             files={"file": ("frame.jpg", jpeg, "image/jpeg")})
 
     # ── check-in conversation (text only: speech is turned into text on the robot) ──

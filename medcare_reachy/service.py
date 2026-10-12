@@ -36,20 +36,34 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
     from medcare_reachy.bridge.speech import Speaker
     from medcare_reachy.bridge.voice import DoneListener
 
-    engine = emotion = None
+    from medcare_reachy.bridge.multimodal import ComputeGovernor, load_multimodal
+
+    engine = emotion = governor = None
     if not settings.get("vision_on_server", True):
         # On-robot landmarks (~3 fps on a Pi 4): sessions stay below the server's recording rate.
-        from medcare_reachy.bridge.emotion import EmotionEngine
         from medcare_reachy.bridge.vision import VisionEngine   # ONNX Runtime; no MediaPipe, no AES needed
 
         await asyncio.to_thread(models.verify_models, models_dir)
         engine = await asyncio.to_thread(VisionEngine, models_dir)
+    if settings.get("multimodal_emotion", True):
+        # Face from the bundled model, voice and words from the Hub (the machine's Hugging Face login), fused on
+        # the robot while the governor keeps it there; otherwise the laptop scores the streamed frames.
+        try:
+            emotion = await asyncio.to_thread(load_multimodal, models_dir, settings["language"])
+        except Exception:   # the dose flow doesn't depend on it
+            log.exception("multimodal emotion is off: its models could not be loaded")
+        governor = ComputeGovernor(settings.get("emotion_compute", "auto"))
+    elif engine is not None:
+        from medcare_reachy.bridge.emotion import EmotionEngine   # face only, as 0.3.0 did
+
         emotion = await asyncio.to_thread(EmotionEngine, models_dir / models.EMOTION_MODEL)
+        governor = ComputeGovernor("robot")
     robot = ReachyRobot.attach(reachy_mini)
     clips = ClipPlayer(robot, CLIPS_DIR, settings["language"])
     clips.audit()
     # A check-in turn Reachy answered with its 「嗯」 is followed, once handed over, by a thinking phrase.
-    voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud)
+    hear = getattr(emotion, "hear", None)
+    voice = DoneListener(robot, settings["language"], think_aloud=clips.think_aloud, on_segment=hear)
     voice.start()
     speaker = Speaker(robot)
     speaker.preload()
@@ -58,8 +72,9 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
             runner = Runner(app=app, robot=robot, clips=clips, voice=voice, speaker=speaker,
                             language=settings["language"],
                             stream=MonitorStream(app, robot, engine, fps=float(settings["capture_fps"]),
-                                                 emotion=emotion),
-                            ack=settings.get("checkin_ack", True), gestures=settings.get("checkin_gestures", True))
+                                                 emotion=emotion, governor=governor),
+                            ack=settings.get("checkin_ack", True), gestures=settings.get("checkin_gestures", True),
+                            mood=emotion if hear is not None else None)
             on_runner(runner)
             await runner.run()
     finally:
@@ -197,6 +212,7 @@ class BridgeService:
                 "camera_fps": round(runner.stream.camera_fps(), 1),
                 "landmark_fps": round(runner.stream.landmark_fps(), 1),
                 "vision_fps": round(runner.stream.vision_fps(), 1),
+                "emotion": getattr(runner.stream, "emotion_status", lambda: None)(),
                 "missing_clips": runner.clips.missing_count,
                 "slot_state": getattr(slot, "state", None) if slot else None,
                 "task_id": slot.task.get("task_id") if slot else None,

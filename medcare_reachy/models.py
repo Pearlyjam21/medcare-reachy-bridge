@@ -22,6 +22,7 @@ MODELS = {
     "emotion_seed43_metadata.json": "a5eb931d1cbb9ed862642bf73713954d318791bd0982020eeb04c051f96be739",
 }
 EMOTION_MODEL = "emotion_seed43.onnx"
+EMOTION_FILES = (EMOTION_MODEL, "emotion_seed43_metadata.json")   # enough for emotion alone (multimodal)
 
 
 class ModelError(RuntimeError):

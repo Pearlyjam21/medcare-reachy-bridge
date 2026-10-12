@@ -346,6 +346,12 @@ def main() -> int:
         run(client, f"{PYTHON} -m pip install 'faster-whisper>=1.1,<2'", timeout=900)
         print("faster-whisper installed")
 
+        # Multimodal emotion (bridge/multimodal): the voice/text models come from the Hub at the app's first start
+        # with the robot's own `hf auth login`; only the packages are installed here.
+        run(client, f"{PYTHON} -m pip install 'huggingface_hub' 'tokenizers>=0.19' 'chinese-converter>=1.0'",
+            timeout=900)
+        print("multimodal emotion packages installed")
+
         run(client, f"mkdir -p ~/.medcare_reachy/models/stt && cd ~/.medcare_reachy/models/stt && "
                     f"([ -s silero_vad.onnx ] || curl -sSL -o silero_vad.onnx {VAD_URL}) && ls -la silero_vad.onnx")
         print("voice activity model ready")

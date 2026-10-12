@@ -204,6 +204,9 @@ class FakeStream:
     def take_error(self):
         return self.errors.pop(0) if self.errors else None
 
+    def emotion_compute(self):
+        return None
+
 
 class FakeApp:
     """Records every call; `fail` maps a method name to a list of exceptions raised on successive calls."""

@@ -76,9 +76,13 @@ class EmotionEngine:
         values = np.asarray(image, dtype=np.float32).transpose(2, 0, 1) / np.float32(255)
         return ((values - MEAN) / STD)[None, ...]
 
+    def logits(self, frame_bgr: np.ndarray, box) -> np.ndarray:
+        """Raw scores in LABELS order (the multimodal engine calibrates and reorders them itself)."""
+        return np.asarray(self.session.run(None, {self.input_name: self.prepare(frame_bgr, box)})[0][0],
+                          dtype=np.float64)
+
     def predict(self, frame_bgr: np.ndarray, box) -> dict[str, float]:
-        logits = np.asarray(self.session.run(None, {self.input_name: self.prepare(frame_bgr, box)})[0][0],
-                            dtype=np.float64)
+        logits = self.logits(frame_bgr, box)
         probabilities = np.exp(logits - logits.max())
         probabilities /= probabilities.sum()
         return {name: float(probabilities[i]) for i, name in enumerate(LABELS)}

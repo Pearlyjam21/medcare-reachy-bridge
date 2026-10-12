@@ -30,6 +30,15 @@ function oneAtATime(send) {
   };
 }
 
+function emotionText(emotion) {
+  if (!emotion) return null;
+  const where = emotion.compute === "laptop" ? "on the laptop" : "on the robot";
+  const branches = Object.entries(emotion.branches || {}).filter(([, on]) => on).map(([name]) => name).join(" + ");
+  const rate = emotion.compute === "robot" && emotion.fps != null ? `, ${emotion.fps} fps` : "";
+  const why = emotion.mode === "auto" && emotion.fallbacks ? ` (fell back ${emotion.fallbacks}×: ${emotion.reason})` : "";
+  return `${where}${branches ? ` (${branches})` : ""}${rate}${why}`;
+}
+
 function show(status) {
   const state = document.getElementById("state");
   state.textContent = STATE_TEXT[status.state] || status.state;
@@ -42,6 +51,7 @@ function show(status) {
     ["Camera feed", status.camera_fps == null ? null : `${status.camera_fps} fps`],
     ["Camera landmarks", status.landmark_fps == null ? null : `${status.landmark_fps} fps`],
     ["Snapshots", status.vision_fps == null ? null : `${status.vision_fps} fps`],
+    ["Emotion", emotionText(status.emotion)],
     ["Current step", status.slot_state],
     ["Missing voice clips", status.missing_clips],
   ];
@@ -86,6 +96,8 @@ form.addEventListener("submit", oneAtATime(async () => {
     capture_fps: Number(form.capture_fps.value),
     checkin_ack: form.checkin_ack.checked,
     checkin_gestures: form.checkin_gestures.checked,
+    multimodal_emotion: form.multimodal_emotion.checked,
+    emotion_compute: form.emotion_compute.value,
   };
   const response = await fetch("/api/config", {
     method: "POST",
