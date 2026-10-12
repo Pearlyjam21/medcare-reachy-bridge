@@ -297,3 +297,20 @@ def test_heartbeat_sends_the_camera_only_when_given():
 
     run(scenario())
     assert bodies == [{"robot_reachable": True}, {"robot_reachable": True, "camera": camera}]
+
+
+@pytest.mark.parametrize("base_url, expected", [
+    ("http://app:8001", "ws://app:8001/api/device/conversations/live"),
+    ("http://192.168.137.1:8001/", "ws://192.168.137.1:8001/api/device/conversations/live"),
+    ("HTTPS://medcare.example:8443", "wss://medcare.example:8443/api/device/conversations/live"),
+])
+def test_the_live_chat_websocket_is_on_the_same_server(base_url, expected):
+    client = AppClient(base_url, "rdv1.token", transport=httpx.MockTransport(lambda request: httpx.Response(204)))
+    assert client.live_url() == expected
+    run(client.aclose())
+
+
+def test_the_live_chat_websocket_carries_the_robot_key():
+    client = make_client(lambda request: httpx.Response(204))
+    assert client.auth_header() == {"Authorization": "Bearer rdv1.token"}
+    run(client.aclose())

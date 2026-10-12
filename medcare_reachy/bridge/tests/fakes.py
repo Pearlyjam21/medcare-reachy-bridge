@@ -2,7 +2,11 @@
 
 import asyncio
 import copy
+import json
+from collections import deque
 from datetime import datetime, timedelta, timezone
+
+import numpy as np
 
 from medcare_reachy.bridge.app_client import DoseRefused, SessionLost
 from medcare_reachy.bridge.session import SlotSession
@@ -26,6 +30,46 @@ class FakeRobot:
         self.reachable = reachable
         self.calls = []
         self.gesture_error = None   # raised by gesture() when set
+        # The live chat's audio (bridge/live.py):
+        self.mic = deque()          # (samples, rate) chunks get_audio() hands out, oldest first
+        self.live_audio = True      # what start_live_audio() answers
+        self.push_error = None      # raised by push_audio() when set
+        self.clear_error = None     # raised by clear_live_audio() when set
+        self.blocks = 0             # blocks push_audio() got, silent ones too
+        self.pushed = []            # the blocks with sound (float32 copies) ...
+        self.pushed_at = []         # ... and the value of `blocks` once each was pushed
+        self.cleared_at = None      # `blocks` when clear_live_audio() was last called
+
+    def get_audio(self):
+        return self.mic.popleft() if self.mic else None
+
+    def start_live_audio(self):
+        self.calls.append("start_live_audio")
+        return self.live_audio
+
+    def push_audio(self, samples):
+        if self.push_error is not None:
+            raise self.push_error
+        self.blocks += 1
+        if np.any(samples):
+            self.pushed.append(np.array(samples, dtype=np.float32))
+            self.pushed_at.append(self.blocks)
+        return True
+
+    def clear_live_audio(self):
+        self.calls.append("clear_live_audio")
+        self.cleared_at = self.blocks
+        if self.clear_error is not None:
+            raise self.clear_error
+
+    def stop_live_audio(self):
+        self.calls.append("stop_live_audio")
+
+    def heard(self):
+        """Every sample with sound the speaker got, as PCM16 values."""
+        if not self.pushed:
+            return np.zeros(0, np.int32)
+        return np.round(np.concatenate(self.pushed) * 32768).astype(np.int32)
 
     def gesture(self, mode):
         self.calls.append(f"gesture:{mode}")
@@ -95,6 +139,8 @@ class FakeVoice:
         self.pause = None       # chat: when the VAD released what the patient said (heard_pause)
         self.speaking = False   # chat: hears_speech()
         self.acks = []          # chat: (when, seconds) of each note_ack
+        self.suspended = False  # a live chat reads the microphone meanwhile (suspend / resume)
+        self.handovers = []     # "suspend" / "resume", in order
 
     def set_active(self, active, mode="done"):
         if active != self.active:
@@ -108,6 +154,14 @@ class FakeVoice:
     def release(self):
         self.holds -= 1
 
+    def suspend(self):
+        self.suspended = True
+        self.handovers.append("suspend")
+
+    def resume(self):
+        self.suspended = False
+        self.handovers.append("resume")
+
     def say(self, word="吃完"):
         assert self.active and self.holds == 0, "the listener is off"
         self.heard = (self.clock.monotonic(), word)
@@ -116,12 +170,14 @@ class FakeVoice:
         """Chat mode: the patient says something (`metrics`: what the listener measured while hearing it); the VAD
         released it at `ended` (default now), and it is decoded at once."""
         assert self.active and self.mode == "chat" and self.holds == 0, "not listening for a conversation"
+        assert not self.suspended, "the live chat has the microphone"
         self.pauses(ended)
         self.utterances.append((text, metrics or {"handover_ms": 400, "segments": 1, "listen_mode": "chat"}))
 
     def pauses(self, ended=None):
         """Chat mode: the VAD released what the patient said; SenseVoice is still decoding it."""
         assert self.active and self.mode == "chat" and self.holds == 0, "not listening for a conversation"
+        assert not self.suspended, "the live chat has the microphone"
         if self.pause is None:
             self.pause = self.clock.monotonic() if ended is None else ended
 
@@ -156,11 +212,21 @@ class FakeVoice:
 class FakeSpeaker:
     STATS = {"tts_first_audio_ms": 1500, "tts_total_ms": 4200, "tts_chunks": 2, "tts_synth_ms": 2900}
 
+    SYNTH_LEVEL = 0.25   # synth(): every sample, 10 ms per character, at 16 kHz
+    SYNTH_RATE = 16000
+
     def __init__(self, available=True, robot=None):
         self.available = available
         self.said = []
+        self.synthesised = []   # synth()'s texts (the live chat)
         self.robot = robot   # gets "say:<text>" in its calls, to check what moved when
-        self.error = None    # raised by say() when set (e.g. synthesis failed)
+        self.error = None    # raised by say() and synth() when set (e.g. synthesis failed)
+
+    def synth(self, text):
+        if self.error is not None:
+            raise self.error
+        self.synthesised.append(text)
+        return np.full(len(text) * self.SYNTH_RATE // 100, self.SYNTH_LEVEL, np.float32), self.SYNTH_RATE
 
     def say(self, text, stats=None, on_audio=None):
         if self.error is not None:
@@ -297,6 +363,65 @@ class FakeApp:
 
     def named(self, name):
         return [call for call in self.calls if call[0] == name]
+
+    def live_url(self):
+        return "ws://app:8001/api/device/conversations/live"
+
+    def auth_header(self):
+        return {"Authorization": "Bearer rdv1.token"}
+
+
+class FakeSocket:
+    """The server's end of the live chat's WebSocket, in bridge/live.py's socket shape: tests `serve()` what the
+    server sends (a dict goes as JSON text, bytes as a binary frame), read what the robot sent, and `drop()` it.
+    `stamp()`, when given, is read at every send (e.g. the robot's block count), into `stamps`."""
+
+    def __init__(self, stamp=None):
+        self.inbox = asyncio.Queue()
+        self.sent = []
+        self.stamps = []
+        self.stamp = stamp
+        self.closed = False
+        self.close_code = None    # the code the server closed with
+        self.closed_with = None   # the code the robot closed with
+
+    async def send(self, data):
+        if self.closed:
+            return False
+        self.sent.append(data)
+        if self.stamp is not None:
+            self.stamps.append(self.stamp())
+        return True
+
+    async def receive(self):
+        if self.closed:
+            return None
+        message = await self.inbox.get()
+        if message is None:
+            self.closed = True
+        return message
+
+    async def close(self, code=1000):
+        if not self.closed:
+            self.closed, self.closed_with = True, code
+            self.inbox.put_nowait(None)
+
+    def serve(self, message):
+        self.inbox.put_nowait(json.dumps(message) if isinstance(message, dict) else message)
+
+    def drop(self, code=1006):
+        self.close_code = code
+        self.inbox.put_nowait(None)
+
+    def json_sent(self):
+        return [json.loads(data) for data in self.sent if isinstance(data, str)]
+
+    def frames_sent(self):
+        return [data for data in self.sent if isinstance(data, bytes)]
+
+    def stamp_of(self, message):
+        """`stamp()` when the robot first sent this JSON message."""
+        return self.stamps[self.sent.index(json.dumps(message))]
 
 
 def dose(intk_id, med_id=None, stats="pending", supported=True):

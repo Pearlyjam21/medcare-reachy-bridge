@@ -7,7 +7,8 @@ import pytest
 
 from medcare_reachy.bridge.app_client import (
     AppClient, AppUnreachable, NotAuthorised, RequestRejected, SessionLost)
-from medcare_reachy.bridge.session import CHECKIN_GREETING, CHECKIN_SILENCE, UNREACHABLE_LIMIT, SlotSession
+from medcare_reachy.bridge import session as session_module
+from medcare_reachy.bridge.session import CHECKIN_GREETING, CHECKIN_MAX, UNREACHABLE_LIMIT, SlotSession
 from medcare_reachy.bridge.tests.fakes import (
     FakeClips, FakeClock, FakeRobot, FakeSpeaker, FakeStream, FakeVoice, Harness, dose, make_task)
 
@@ -56,10 +57,26 @@ def test_reachy_is_muted_while_it_speaks():
     assert h.voice.max_holds >= 1 and h.voice.holds == 0
 
 
-def test_silence_ends_the_conversation():
+def test_silence_alone_never_ends_the_conversation():
+    """A companion stays while the patient is quiet: no silence limit by default (0.7.1)."""
     h = after_one_dose()
     h.tick()
-    h.tick(CHECKIN_SILENCE - 1)
+    h.tick(CHECKIN_MAX - 1)
+    assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")
+
+
+def test_the_conversation_ends_at_its_time_limit():
+    h = after_one_dose()
+    h.tick()
+    h.tick(CHECKIN_MAX + 1)
+    assert ("conversation_end", "c1", "finished") in h.app.calls and h.slot.state == "POST_SLOT_OBSERVE"
+
+
+def test_a_silence_limit_can_still_be_set(monkeypatch):
+    monkeypatch.setattr(session_module, "CHECKIN_SILENCE", 25.0)
+    h = after_one_dose()
+    h.tick()
+    h.tick(24)
     assert h.slot.state == "CHECKIN"
     h.tick(2)
     assert ("conversation_end", "c1", "silence") in h.app.calls and h.slot.state == "POST_SLOT_OBSERVE"
@@ -89,11 +106,11 @@ def test_conversation_only_task_greets_finds_the_patient_and_chats():
     assert "wake_greeting" not in h.clips.played
     assert h.slot.state == "CHECKIN" and "in_progress" in h.statuses()
     h.tick()
-    h.tick(CHECKIN_SILENCE + 1)
+    h.tick(CHECKIN_MAX + 1)
     assert h.slot.state == "WIND_DOWN"
     h.run_until(lambda: h.slot.done)
     assert h.slot.result == "completed"
-    assert h.app.named("task_status")[-1][2] == {"outcomes": {"checkin": "silence"}}
+    assert h.app.named("task_status")[-1][2] == {"outcomes": {"checkin": "finished"}}
 
 
 def test_stopping_mid_conversation_closes_it():
@@ -339,10 +356,10 @@ def test_the_help_line_after_a_risk_is_said_still():
     assert ("conversation_end", "c1", "risk") in h.app.calls
 
 
-def test_the_silence_goodbye_is_not_acknowledged():
+def test_the_closing_at_the_time_limit_is_not_acknowledged():
     h = chatting()
-    h.tick(CHECKIN_SILENCE + 1)
-    assert ("conversation_end", "c1", "silence") in h.app.calls
+    h.tick(CHECKIN_MAX + 1)
+    assert ("conversation_end", "c1", "finished") in h.app.calls
     assert "ack" not in h.clips.played and "gesture:think" not in h.robot.calls
 
 

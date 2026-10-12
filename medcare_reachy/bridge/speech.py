@@ -199,3 +199,22 @@ class Speaker:
             if first_audio is not None:
                 stats["tts_first_audio_ms"] = _ms(first_audio)
         return played
+
+    def synth(self, text: str) -> tuple[np.ndarray, int] | None:
+        """`text` in Reachy's voice without playing it: (float32 mono samples, their rate). The live chat
+        (bridge/live.py) owns the speaker and queues the samples itself; it calls this for one chunk at a time, so
+        its first sound waits for one chunk only. Blocks for the synthesis (about real time on the Pi). None when there
+        is no voice, nothing to say, or no sound came out."""
+        pieces = chunks(text)
+        if not pieces or not self.available:
+            return None
+        tts = self._tts()
+        parts, rate = [], 0
+        for piece in pieces:
+            audio = tts.generate(piece, sid=0, speed=SPEED)
+            if len(audio.samples):
+                parts.append(np.asarray(audio.samples, dtype=np.float32))
+                rate = int(audio.sample_rate)
+        if not parts:
+            return None
+        return np.concatenate(parts), rate
