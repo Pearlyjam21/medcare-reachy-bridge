@@ -158,8 +158,42 @@ passed its Check. Otherwise check-ins work as before.
   speaker queue as GPT-Live's voice.
 - It uses the `websockets` package, which the robot's apps environment already has.
 
+## Companion session (0.9.0)
+
+From 0.9.0 a check-in is a companion session: Reachy stays with the patient until they say goodbye (拜拜, 再見 and
+similar). The same rules hold for the live voice chat and for the text chat; only the "brain" differs. Update the
+MedAiCarePlus server at the same time: a robot older than 0.9.0 keeps its old rules, and an older server does not know
+the new ones.
+
+- When Reachy finds the patient, it greets them in its own voice and listens. The camera stays on during the chat, at
+  2 frames a second.
+- Live voice: GPT-Live starts only when the patient speaks and the camera recognised them in the last 15 seconds.
+  After 30 seconds without the patient speaking, the server pauses GPT-Live (no cost while paused) and Reachy keeps
+  listening; the patient's next words start it again, with the conversation so far. The robot tells the server when
+  the patient starts to speak, with the speech listener's voice detector model; it ignores Reachy's own sound until
+  about 0.75 seconds after it. Without that model, or if the detector fails, check-ins use the text chat.
+- Reachy rests after 10 minutes with no voice and nobody seen: it says 「我先休息一下，有需要再叫我喔。」 and goes to
+  sleep. While the patient is in view, it stays awake.
+- When a medicine falls due, Reachy says 「該吃藥囉，我們等一下再聊。」, ends the chat and starts the medicine reminder.
+  It first lets the patient finish: words they have just said go to the server and get their answer, for at most
+  30 seconds (`MEDICINE_WAIT_SECONDS`; in the live chat, until they stopped speaking 2 seconds before,
+  `MEDICINE_SPEECH_GAP_SECONDS`). A dose the patient left pending before the chat counts as such a medicine when the
+  server's reminder retry for it comes during the chat.
+- Only a fresh camera answer counts as the patient in view: if the camera stops, Reachy rests after 10 minutes as if
+  nobody were there. A live chat whose camera has not worked for 30 seconds (`CAMERA_LOST_SECONDS`) goes on as the
+  text chat, because GPT-Live starts only for a patient the camera recognises.
+- When GPT-Live cannot start for words the patient just said, Reachy asks 「不好意思，我剛剛沒聽清楚，可以再說一次嗎？」 and the
+  text chat listens.
+- The chat also ends on a risk (Reachy says the help line and family are alerted), a stop from the web app, or a
+  consent withdrawn (the text chat too, at once, when the microphone consent is withdrawn). Once the server has ended
+  a live chat, the robot never cuts its last line short for a medicine or a rest. There is no time limit any more.
+
 ## Status
 
+- **0.10.0**: merges the Space's 0.9.0 companion session (GPT-Live check-ins that stay until goodbye) with 0.9.1
+  (multimodal emotion while a dose is watched, face following, the microphone start for SDK 1.8.3).
+- **0.9.0** (for testing; not on this space yet): the companion session (above). A check-in stays until a goodbye,
+  rests after 10 minutes with no voice and nobody seen, and stops for a medicine that falls due.
 - **0.9.1**: the robot app starts the microphone itself. Reachy Mini SDK 1.8.3 (the robot after a reset) never starts it, so every read was empty and neither 「我吃完了」 nor a check-in was heard.
 - **0.9.0**: multimodal emotion (face + voice + words) while a dose is watched, computed on the robot with a laptop
   fallback (above); the head follows the patient's face while a dose is watched (*Follow the patient's face*,

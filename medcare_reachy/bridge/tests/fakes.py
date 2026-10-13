@@ -255,20 +255,30 @@ class FakeStream:
     def __init__(self):
         self.attached = None
         self.latest = None
+        self.latest_at = None   # when `latest` came (MonitorStream's; Harness.see() sets it)
         self.errors = []
         self.history = []
         self.camera = FakeCamera()
+        self.max_fps = None     # set_max_fps(): the companion session's camera rate, None for the stream's own
+        self.frame_seq = 0      # the attached session's last streamed frame (MonitorStream's; tests set it)
+
+    def set_max_fps(self, fps):
+        self.max_fps = fps
 
     def attach(self, monitor):
         self.attached = monitor
-        self.latest = None
+        self.latest = self.latest_at = None
+        self.frame_seq = 0
+        self.camera.state = "ok"   # as the watchdog's attach(): a fresh try
         self.history.append(("attach", monitor["session_id"]))
 
     def detach(self):
         if self.attached:
             self.history.append(("detach", self.attached["session_id"]))
         self.attached = None
-        self.latest = None
+        self.latest = self.latest_at = None
+        if self.camera.state != "unavailable":   # as the watchdog's detach(): "unavailable" stays
+            self.camera.state = "idle"
 
     def take_error(self):
         return self.errors.pop(0) if self.errors else None
@@ -288,6 +298,8 @@ class FakeApp:
         self.fail = {}
         self.unreachable_since = None
         self.sessions = []
+        self.companion_starts = []   # conversation_start's `companion`, per call
+        self.monitor_companion = []   # monitor_start's `companion`, per call
 
     def _maybe_fail(self, name):
         queue = self.fail.get(name)
@@ -321,8 +333,9 @@ class FakeApp:
         self._maybe_fail("extra_event")
         return {"ok": True}
 
-    async def monitor_start(self, mode, intk_id, task_id):
+    async def monitor_start(self, mode, intk_id, task_id, companion=False):
         self.calls.append(("monitor_start", mode, intk_id))
+        self.monitor_companion.append(companion)
         self._maybe_fail("monitor_start")
         n = len(self.sessions) + 1
         session = {"session_id": f"s{n}", "generation": f"g{n}", "mode": mode, "intk_id": intk_id,
@@ -330,8 +343,9 @@ class FakeApp:
         self.sessions.append(session)
         return dict(session)
 
-    async def conversation_start(self, task_id, language):
+    async def conversation_start(self, task_id, language, companion=False):
         self.calls.append(("conversation_start", task_id, language))
+        self.companion_starts.append(companion)
         self._maybe_fail("conversation_start")
         self.turn_ids = 1
         return {"conversation_id": "c1", "reply": "今天感覺怎麼樣？", "speech_text": "今天感觉怎么样？", "end": False,
@@ -430,8 +444,10 @@ def dose(intk_id, med_id=None, stats="pending", supported=True):
             "units_per_dose": 1, "intake_stats": stats, "supported": supported}
 
 
-def make_task(doses, *, status="leased", reason="upcoming", auto_record=True, expires_in=3600, microphone=False,
+def make_task(doses, *, status="leased", reason="upcoming", auto_record=True, expires_in=3600, microphone=None,
               checkin=False):
+    if microphone is None:   # as the server: check-in consent includes the microphone (CHECKIN_SCOPES)
+        microphone = checkin
     return {"task_id": "task-1", "slot_time": "2026-10-01T00:00:00+00:00", "reason": reason, "attempt": 1,
             "status": status, "expires_at": (BASE_WALL + timedelta(seconds=expires_in)).isoformat(),
             "patient_name": "Amy", "auto_record": auto_record, "microphone": microphone, "checkin": checkin,
@@ -459,6 +475,7 @@ class Harness:
         """Pretend the attached monitor session answered with this public() state."""
         assert self.stream.attached, "no monitor session attached"
         self.stream.latest = {"session_id": self.stream.attached["session_id"], **state}
+        self.stream.latest_at = self.clock.t   # the answer came now
 
     def run_until(self, predicate, step=0.5, limit=2000):
         for _ in range(limit):

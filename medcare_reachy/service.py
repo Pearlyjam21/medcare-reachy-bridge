@@ -27,6 +27,16 @@ STEP_TEXT = {
 }
 
 
+def face_follower(robot, settings: dict):
+    """The head that keeps the verified patient's face centred while a dose is watched (bridge/follow.py), or None
+    when the settings page's "Follow the patient's face" is off. Recentring goes back to the neutral pose."""
+    if not settings.get("follow_face", True):
+        return None
+    from medcare_reachy.bridge.follow import FaceFollower
+
+    return FaceFollower(robot.look_at, robot.hold_head)
+
+
 async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runner) -> None:
     # Deferred so the settings page works even if a dependency is still installing or broken.
     from medcare_reachy.bridge.app_client import AppClient
@@ -74,7 +84,7 @@ async def default_bridge(reachy_mini, settings: dict, models_dir: Path, on_runne
                             stream=MonitorStream(app, robot, engine, fps=float(settings["capture_fps"]),
                                                  emotion=emotion, governor=governor),
                             ack=settings.get("checkin_ack", True), gestures=settings.get("checkin_gestures", True),
-                            mood=emotion if hear is not None else None)
+                            mood=emotion if hear is not None else None, follow=face_follower(robot, settings))
             on_runner(runner)
             await runner.run()
     finally:

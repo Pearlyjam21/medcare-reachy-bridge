@@ -67,3 +67,25 @@ def test_robot_errors_never_escape():
     assert f.update([0.1, 0.1, 0.4, 0.4]) is True
     f.stop()
     assert f.update([0.5, 0.5, 0.2, 0.2]) is False
+
+
+def test_the_service_builds_the_follower_from_the_settings():
+    """0.8.0-0.9.1 had the follower and its setting but never built one, so the head never followed."""
+    from medcare_reachy.service import face_follower
+
+    class Robot:
+        def __init__(self):
+            self.calls = []
+
+        def look_at(self, u, v, duration):
+            self.calls.append(("look_at", round(u, 2), round(v, 2)))
+
+        def hold_head(self):
+            self.calls.append(("hold_head",))
+
+    robot = Robot()
+    assert face_follower(robot, {"follow_face": False}) is None
+    follower = face_follower(robot, {})            # on by default
+    follower.start()
+    assert follower.update([0.1, 0.1, 0.4, 0.4]) is True
+    assert robot.calls == [("look_at", 0.3, 0.3)]

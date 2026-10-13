@@ -8,7 +8,9 @@ import pytest
 from medcare_reachy.bridge.app_client import (
     AppClient, AppUnreachable, NotAuthorised, RequestRejected, SessionLost)
 from medcare_reachy.bridge import session as session_module
-from medcare_reachy.bridge.session import CHECKIN_GREETING, CHECKIN_MAX, UNREACHABLE_LIMIT, SlotSession
+from medcare_reachy.bridge.session import (
+    CHECKIN_GREETING, COMPANION_CAPTURE_FPS, MEDICINE_LINE, REST_AFTER_SECONDS, REST_LINE, UNREACHABLE_LIMIT,
+    SlotSession)
 from medcare_reachy.bridge.tests.fakes import (
     FakeClips, FakeClock, FakeRobot, FakeSpeaker, FakeStream, FakeVoice, Harness, dose, make_task)
 
@@ -28,10 +30,12 @@ def test_after_the_last_dose_reachy_chats_then_observes():
     h = after_one_dose()
     assert h.slot.state == "CHECKIN"
     h.tick()   # opens the conversation and speaks the opening line
-    assert ("conversation_start", "task-1", "zh-TW") in h.app.calls
+    assert ("conversation_start", "task-1", "zh-TW") in h.app.calls and h.app.companion_starts == [True]
     assert h.speaker.said == ["今天感觉怎么样？"]
     assert h.voice.active and h.voice.mode == "chat"
-    assert ("monitor_end", "s2") in h.app.calls          # the camera session ends while chatting
+    # The dose session ends; the camera stays on in an observe session, slowly: it only tells who is there (0.9.0).
+    assert ("monitor_end", "s2") in h.app.calls and ("monitor_start", "observe", None) in h.app.calls
+    assert h.stream.attached["session_id"] == "s3" and h.stream.max_fps == COMPANION_CAPTURE_FPS
 
     h.voice.speak("我早上去散步了")
     h.tick(1)
@@ -43,6 +47,26 @@ def test_after_the_last_dose_reachy_chats_then_observes():
     assert ("conversation_end", "c1", "goodbye") in h.app.calls
     assert h.slot.state == "POST_SLOT_OBSERVE" and h.slot.outcomes["checkin"] == "goodbye"
     assert h.voice.active is False
+    h.tick()   # POST_SLOT_OBSERVE opens its own camera session (the companion's was flagged)
+    assert h.stream.attached["session_id"] == "s4" and h.stream.max_fps is None   # observing on, at the full rate
+
+
+def test_the_observe_session_of_a_companion_session_says_companion_and_one_outside_it_does_not():
+    h = Harness(make_task([dose(1)], microphone=True, checkin=True), voice=True, speaker=True)
+    h.find_patient()   # the search before the dose
+    assert h.app.named("monitor_start") == [("monitor_start", "observe", None)] and h.app.monitor_companion == [False]
+    h.verify_and_prompt()
+    h.see(identity_status="verified", recorded=RECORDED)
+    h.tick()
+    h.tick()   # the companion session begins; its camera session is opened for it
+    assert h.app.named("monitor_start")[-1] == ("monitor_start", "observe", None) and h.app.monitor_companion[-1] is True
+    h.app.replies = [{"reply": "再見", "speech_text": "再见", "end": True}]
+    h.voice.speak("好，拜拜")
+    h.tick(1)
+    assert h.slot.state == "POST_SLOT_OBSERVE" and h.slot.companion_since is None
+    h.tick()
+    assert h.app.monitor_companion[-1] is False   # the watch after the dose runs on a new session, without the flag
+    assert h.stream.attached["session_id"] == "s4"
 
 
 def test_without_checkin_consent_there_is_no_conversation():
@@ -58,18 +82,173 @@ def test_reachy_is_muted_while_it_speaks():
 
 
 def test_silence_alone_never_ends_the_conversation():
-    """A companion stays while the patient is quiet: no silence limit by default (0.7.1)."""
+    """A companion stays while the patient is quiet: no silence limit by default (0.7.1), and no time limit while the
+    patient is in view (0.9.0: the 5-minute CHECKIN_MAX is gone)."""
     h = after_one_dose()
     h.tick()
-    h.tick(CHECKIN_MAX - 1)
+    for _ in range(6):                                    # an hour, in view: the camera's answers keep coming
+        h.see(identity_status="verified")
+        h.tick(REST_AFTER_SECONDS - 1)
     assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")
 
 
-def test_the_conversation_ends_at_its_time_limit():
+def test_reachy_rests_after_ten_minutes_with_no_voice_and_nobody_seen():
     h = after_one_dose()
     h.tick()
-    h.tick(CHECKIN_MAX + 1)
-    assert ("conversation_end", "c1", "finished") in h.app.calls and h.slot.state == "POST_SLOT_OBSERVE"
+    h.see(identity_status="searching")                    # the patient left the camera's view
+    h.tick(REST_AFTER_SECONDS - 1)
+    assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")
+    h.tick(2)
+    assert h.speaker.said[-1] == REST_LINE["zh-TW"] and h.voice.spoken[-1] == REST_LINE["zh-TW"]
+    assert ("conversation_end", "c1", "patient_left") in h.app.calls
+    assert h.slot.state == "WIND_DOWN"                    # Reachy sleeps now: no two minutes of POST_SLOT_OBSERVE
+    h.run_until(lambda: h.slot.done)
+    assert "wind_down" not in h.clips.played             # it has just said why it rests
+    assert h.app.named("task_status")[-1][1:] == (
+        "completed", {"outcomes": {"1": "recorded", "checkin": "patient_left"}})
+    assert h.stream.max_fps is None
+
+
+def test_the_patient_in_view_keeps_reachy_awake():
+    h = after_one_dose()
+    h.tick()
+    for _ in range(3):                                    # in view for 15 minutes: the camera's answers keep coming
+        h.see(identity_status="verified")
+        h.tick(REST_AFTER_SECONDS / 2)
+    assert h.slot.state == "CHECKIN"
+    h.see(identity_status="searching")                    # then they step away
+    h.tick(REST_AFTER_SECONDS / 2 - 1)
+    assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")   # counted from the last sighting
+    h.tick(2)
+    assert ("conversation_end", "c1", "patient_left") in h.app.calls
+
+
+def test_a_stale_sighting_never_keeps_reachy_awake():
+    """The camera stops after one verified answer (MonitorStream keeps that answer): it counts as a sighting when it
+    came, not on every tick after."""
+    h = after_one_dose()
+    h.tick()
+    h.see(identity_status="verified")                     # the last answer before the camera stopped
+    h.tick(REST_AFTER_SECONDS - 1)
+    assert h.slot.state == "CHECKIN"
+    h.tick(2)
+    assert h.speaker.said[-1] == REST_LINE["zh-TW"] and ("conversation_end", "c1", "patient_left") in h.app.calls
+
+
+def test_the_patients_voice_keeps_reachy_awake():
+    h = after_one_dose()
+    h.tick()
+    h.see(identity_status="searching")
+    h.tick(REST_AFTER_SECONDS - 10)
+    h.voice.speaking = True                               # the listener hears the patient (no turn yet)
+    h.tick(1)
+    h.voice.speaking = False
+    h.tick(REST_AFTER_SECONDS - 1)
+    assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")
+    h.voice.speak("我還在這裡")                             # a turn counts too
+    h.tick(1)
+    h.tick(REST_AFTER_SECONDS - 1)
+    assert h.slot.state == "CHECKIN" and not h.app.named("conversation_end")
+    h.tick(2)
+    assert ("conversation_end", "c1", "patient_left") in h.app.calls
+
+
+def test_a_due_medicine_ends_the_chat_with_reachys_line():
+    h = after_one_dose()
+    h.tick()
+    h.slot.medicine_due()                                 # a heartbeat's task_due
+    h.tick(0.2)
+    assert h.speaker.said[-1] == MEDICINE_LINE["zh-TW"]
+    assert ("conversation_end", "c1", "medicine") in h.app.calls and h.slot.state == "WIND_DOWN"
+    h.run_until(lambda: h.slot.done)
+    assert "wind_down" not in h.clips.played and h.slot.result == "completed"
+    assert h.app.named("task_status")[-1][2] == {"outcomes": {"1": "recorded", "checkin": "medicine"}}
+
+
+def test_words_the_patient_just_said_go_to_the_server_before_the_medicine_line():
+    h = after_one_dose()
+    h.tick()
+    h.voice.pauses()                                      # the patient said something; Whisper is decoding it
+    h.slot.medicine_due()                                 # a heartbeat's task_due lands meanwhile
+    h.tick(0.2)
+    assert not h.app.named("conversation_end") and MEDICINE_LINE["zh-TW"] not in h.speaker.said   # it waits
+    h.voice.speak("我剛剛頭有點暈")                         # the words are decoded
+    h.tick(1)
+    assert h.app.named("conversation_turn")[-1][1:3] == ("c1", "我剛剛頭有點暈") and h.speaker.said[-1] == "真好"
+    assert not h.app.named("conversation_end")
+    h.tick(0.2)                                           # nothing more held: now the medicine
+    assert h.speaker.said[-1] == MEDICINE_LINE["zh-TW"] and ("conversation_end", "c1", "medicine") in h.app.calls
+
+
+def test_a_medicine_due_while_reachy_answers_waits_for_the_answer():
+    h = after_one_dose()
+    h.tick()
+    say = h.speaker.say
+
+    def heartbeat_meanwhile(text, stats=None, on_audio=None):
+        h.slot.medicine_due()                             # the heartbeat lands while Reachy speaks
+        return say(text, stats, on_audio)
+
+    h.speaker.say = heartbeat_meanwhile
+    h.voice.speak("我早上去散步了")
+    h.tick(1)
+    assert h.speaker.said[-1] == "真好" and not h.app.named("conversation_end")
+    h.tick(0.2)
+    assert h.speaker.said[-2:] == ["真好", MEDICINE_LINE["zh-TW"]]
+    assert ("conversation_end", "c1", "medicine") in h.app.calls
+
+
+def test_a_due_medicine_never_cuts_a_dose_short():
+    h = Harness(make_task([dose(1)], microphone=True, checkin=True), voice=True, speaker=True)
+    h.find_patient()
+    h.verify_and_prompt()
+    h.slot.medicine_due()                                 # WATCHING: the dose task finishes first
+    h.see(identity_status="verified", recorded=RECORDED)
+    h.tick()
+    h.tick()
+    h.tick(1)
+    assert h.slot.state == "CHECKIN" and h.slot.chat_id == "c1" and not h.app.named("conversation_end")
+
+
+def test_hand_to_mouth_moments_while_chatting_are_no_news_for_family():
+    h = after_one_dose()
+    h.tick()
+    sip = {"event_id": "e1", "decision": "uncertain", "confidence": 0.3}
+    h.see(identity_status="verified", extra_events=[sip])     # a sip of tea while chatting
+    h.tick(1)
+    assert not h.app.named("extra_event")
+    h.app.replies = [{"reply": "再見", "speech_text": "再见", "end": True}]
+    h.voice.speak("好，拜拜")
+    h.tick(1)
+    assert h.slot.state == "POST_SLOT_OBSERVE"
+    later = {"event_id": "e2", "decision": "uncertain", "confidence": 0.4}
+    h.see(identity_status="verified", extra_events=[sip, later])   # after the chat, at the full rate: as before
+    h.tick(1)
+    assert h.app.named("extra_event") == [("extra_event", "e2", "uncertain", 0.4)]
+
+
+def test_a_hand_to_mouth_moment_during_reachys_last_line_is_no_news_either():
+    h = after_one_dose()
+    h.tick()
+    say = h.speaker.say
+    sip = {"event_id": "e1", "decision": "uncertain", "confidence": 0.3, "frame_seq": 40}
+
+    def sip_during_goodbye(text, stats=None, on_audio=None):
+        h.stream.frame_seq = 41                                   # frames streamed while Reachy says goodbye
+        h.see(identity_status="verified", extra_events=[sip])
+        return say(text, stats, on_audio)
+
+    h.speaker.say = sip_during_goodbye
+    h.app.replies = [{"reply": "再見", "speech_text": "再见", "end": True}]
+    h.voice.speak("好，拜拜")
+    h.tick(1)
+    assert h.slot.state == "POST_SLOT_OBSERVE" and not h.app.named("extra_event")
+    h.speaker.say = say
+    in_flight = {"event_id": "e2", "decision": "uncertain", "confidence": 0.3, "frame_seq": 41}   # answered late
+    later = {"event_id": "e3", "decision": "uncertain", "confidence": 0.4, "frame_seq": 42}
+    h.see(identity_status="verified", extra_events=[sip, in_flight, later])
+    h.tick(1)
+    assert h.app.named("extra_event") == [("extra_event", "e3", "uncertain", 0.4)]
 
 
 def test_a_silence_limit_can_still_be_set(monkeypatch):
@@ -106,11 +285,25 @@ def test_conversation_only_task_greets_finds_the_patient_and_chats():
     assert "wake_greeting" not in h.clips.played
     assert h.slot.state == "CHECKIN" and "in_progress" in h.statuses()
     h.tick()
-    h.tick(CHECKIN_MAX + 1)
-    assert h.slot.state == "WIND_DOWN"
+    # The search's camera session goes on through the chat, slowly (0.9.0).
+    assert h.stream.attached["session_id"] == "s1" and h.stream.max_fps == COMPANION_CAPTURE_FPS
+    assert not h.app.named("monitor_end")
+    h.see(identity_status="searching")
+    h.tick(REST_AFTER_SECONDS + 1)
+    assert h.slot.state == "WIND_DOWN" and h.speaker.said[-1] == REST_LINE["zh-TW"]
     h.run_until(lambda: h.slot.done)
-    assert h.slot.result == "completed"
-    assert h.app.named("task_status")[-1][2] == {"outcomes": {"checkin": "finished"}}
+    assert h.slot.result == "completed" and ("monitor_end", "s1") in h.app.calls
+    assert h.app.named("task_status")[-1][2] == {"outcomes": {"checkin": "patient_left"}}
+
+
+def test_a_withdrawn_microphone_ends_todays_companion_chat():
+    h = after_one_dose()
+    h.tick()
+    assert h.voice.active and h.voice.mode == "chat"
+    h.slot.task["microphone"] = False                     # the heartbeat's "microphone": false
+    h.tick(0.2)
+    assert ("conversation_end", "c1", "stopped") in h.app.calls and h.voice.active is False
+    assert h.slot.outcomes["checkin"] == "microphone_withdrawn"
 
 
 def test_stopping_mid_conversation_closes_it():
@@ -119,6 +312,7 @@ def test_stopping_mid_conversation_closes_it():
     h.slot.stop("stop_all")
     h.tick()
     assert ("conversation_end", "c1", "stopped") in h.app.calls and h.slot.done
+    assert h.stream.attached is None and h.stream.max_fps is None   # no slow camera left for the next task
 
 
 HEARD = {"speech_ms": 1800, "segments": 2, "vad_release_ms": 530, "stt_ms": 1100, "stt_last_ms": 600,
@@ -354,13 +548,6 @@ def test_the_help_line_after_a_risk_is_said_still():
     assert calls[calls.index("gesture:think"):calls.index("say:请打 1925") + 1] == [
         "gesture:think", "gesture:None", "say:请打 1925"]
     assert ("conversation_end", "c1", "risk") in h.app.calls
-
-
-def test_the_closing_at_the_time_limit_is_not_acknowledged():
-    h = chatting()
-    h.tick(CHECKIN_MAX + 1)
-    assert ("conversation_end", "c1", "finished") in h.app.calls
-    assert "ack" not in h.clips.played and "gesture:think" not in h.robot.calls
 
 
 def test_mm_and_gestures_can_each_be_switched_off():

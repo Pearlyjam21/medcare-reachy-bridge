@@ -125,10 +125,13 @@ class MonitorStream:
         self.clock, self.run_blocking, self.encode, self.stream_encode = clock, run_blocking, encode, stream_encode
         self.max_in_flight = max_in_flight
         self._frames_in_flight = 0
+        self.fps = fps
         self.interval = 1.0 / fps
+        self._max_fps: float | None = None   # set_max_fps's cap, None without one
         self.vision_interval = vision_interval
         self.session: dict | None = None
         self.latest: dict | None = None
+        self.latest_at: float | None = None   # when `latest` came from the server (clock); None for attach's answer
         self.frame_seq = 0
         self._latest_seq = 0
         self._error: Exception | None = None
@@ -154,6 +157,7 @@ class MonitorStream:
     def attach(self, monitor: dict) -> None:
         self.session = {"session_id": monitor["session_id"], "generation": monitor["generation"]}
         self.latest = dict(monitor)
+        self.latest_at = None
         self.frame_seq = 0
         self._latest_seq = 0
         self._error = None
@@ -167,11 +171,19 @@ class MonitorStream:
     def detach(self) -> None:
         self.session = None
         self.latest = None
+        self.latest_at = None
         self.camera.detach()
 
     def take_error(self) -> Exception | None:
         error, self._error = self._error, None
         return error
+
+    def set_max_fps(self, fps: float | None) -> None:
+        """At most `fps` frames a second from the next frame on (a companion session's COMPANION_CAPTURE_FPS: its
+        camera only tells who is there, at less CPU for the robot and the server), or None: back to the rate this
+        stream was made with. Below SERVER_FPS_MIN the slow-camera warning is off: slow on purpose."""
+        self._max_fps = fps
+        self.interval = 1.0 / (self.fps if fps is None else min(self.fps, fps))
 
     # ── rates for the heartbeat ──────────────────────────────────────────
     def _rate(self, times: deque) -> float:
@@ -323,14 +335,15 @@ class MonitorStream:
         """
         gap = 0.0 if self._last_streamed is None else captured - self._last_streamed
         self._last_streamed = captured
-        if gap > STALL_SECONDS:
+        limit = max(STALL_SECONDS, 2 * self.interval)   # a slowed stream (set_max_fps) has long gaps by design
+        if gap > limit:
             self._stalls += 1
             if captured - self._last_stall_log >= STALL_LOG_SECONDS:
                 self._last_stall_log = captured
                 log.warning("server stream: %.2f s between frames before frame %d (%d gap(s) over %.2f s since the "
                             "last report); longest wait for a camera frame %.2f s, event loop up to %.2f s late, "
                             "frames dropped for want of a free request slot: %d (oldest unanswered request %.2f s)",
-                            gap, self.frame_seq, self._stalls, STALL_SECONDS, self._camera_wait, self._loop_late,
+                            gap, self.frame_seq, self._stalls, limit, self._camera_wait, self._loop_late,
                             self._no_slot, self._oldest_request)
                 self._stalls = 0
         self._clear_stall_notes()
@@ -345,12 +358,15 @@ class MonitorStream:
             self._streaming_since = None
 
     def _note_camera_frame(self, captured: float) -> None:
-        """Count camera frames, and say once in the log when the camera alone keeps the server from recording."""
+        """Count camera frames, and say once in the log when the camera alone keeps the server from recording; not
+        while this stream's own cap (set_max_fps, a companion session) reads the camera that slowly on purpose."""
         self._camera_times.append(captured)
         fps = self.camera_fps()   # also forgets frames older than the window
         if self._streaming_since is None:
             self._streaming_since = captured
-        if not self._slow_camera_logged and captured - self._streaming_since >= FPS_WINDOW and fps < SERVER_FPS_MIN:
+        capped = self._max_fps is not None and self._max_fps < SERVER_FPS_MIN
+        if (not self._slow_camera_logged and not capped and captured - self._streaming_since >= FPS_WINDOW
+                and fps < SERVER_FPS_MIN):
             self._slow_camera_logged = True
             # Reachy Mini daemon 1.11 caps the camera feed it shares with apps at 10 fps (IPC_FPS in
             # reachy_mini/media/media_server.py); tools/deploy_to_robot.py --camera-ipc-fps 15 lifts it.
@@ -472,6 +488,7 @@ class MonitorStream:
             return
         self._latest_seq = seq
         self.latest = response
+        self.latest_at = self.clock()
 
     def _fail(self, session, exc: Exception) -> None:
         if self.session is session:
@@ -581,7 +598,8 @@ class Runner:
             await self.run_blocking(self.robot.restore_media)
         payload = {"robot_reachable": self.robot_reachable, "landmark_fps": self.stream.landmark_fps(),
                    "vision_fps": self.stream.vision_fps(), "bridge_version": __version__,
-                   "missing_clips": self.clips.missing_count}
+                   "missing_clips": self.clips.missing_count,
+                   "companion": bool(self.slot is not None and getattr(self.slot, "companion_since", None) is not None)}
         compute = getattr(self.stream, "emotion_compute", lambda: None)()
         if compute is not None:   # the server ignores fields it doesn't know yet
             payload.update({"emotion_compute": compute, "emotion_fps": self.stream.emotion_fps()})
@@ -598,6 +616,9 @@ class Runner:
         if self.slot and "microphone" in response:
             # Withdrawn microphone consent takes effect within one heartbeat, not only at the next task.
             self.slot.task["microphone"] = bool(response["microphone"])
+        if response.get("task_due") and self.slot:
+            # Medicine first (spec 2026-10-12 companion 4.5): a companion session ends for a medicine task now due.
+            self.slot.medicine_due()
         return response
 
     async def _heartbeat_loop(self) -> None:

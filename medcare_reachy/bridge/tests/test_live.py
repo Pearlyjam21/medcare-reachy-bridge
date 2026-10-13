@@ -1,22 +1,29 @@
 """Live voice check-ins on the robot (bridge/live.py, spec 2026-10-12 F1): the WebSocket to the server's GPT-Live
 relay, the microphone frames, the playback queue and its jitter buffer, flush, Reachy's own lines through the same
-queue, the playing/idle reports and how a chat ends."""
+queue, the playing/idle reports and how a chat ends; and the companion chat (spec 2026-10-12 companion session):
+the voice detector and its speech signals, the spoken opening and a stop with a last line."""
 
 import asyncio
 import json
+import sys
 import time
+import types
 
 import numpy as np
 import pytest
 
 from medcare_reachy.bridge import __version__, live
 from medcare_reachy.bridge.live import (
-    BLOCK_SAMPLES, FRAME_SAMPLES, IDLE_QUIET_BLOCKS, JITTER_START_SECONDS, MAX_SECONDS, READY_TIMEOUT, RATE,
-    SAY_TAIL_BLOCKS, LiveChat, LiveOutcome, Player)
+    BLOCK_SAMPLES, FRAME_SAMPLES, IDLE_QUIET_BLOCKS, JITTER_START_SECONDS, MAX_SECONDS,
+    POLL_SECONDS, READY_TIMEOUT, RATE, SAY_TAIL_BLOCKS, SPEECH_ECHO_GUARD_SECONDS, SPEECH_SIGNAL_GAP_SECONDS, LiveChat, LiveOutcome, Player,
+    SpeechStart)
 from medcare_reachy.bridge.speech import chunks
 from medcare_reachy.bridge.tests.fakes import FakeApp, FakeClock, FakeRobot, FakeSocket, FakeSpeaker, make_task
+from medcare_reachy.bridge.voice import MIN_SILENCE_SECONDS, MIN_SPEECH_SECONDS, VAD_WINDOW
 
 HELP = "我很担心您。请马上拨打一一九。"   # a 'say' line, as the server sends it (Simplified, for Matcha)
+OPENING = "王奶奶，今天感觉怎么样？想跟我聊聊吗？"   # the companion relay's opening, in the voice's characters
+LAST_LINE = "该吃药啰，我们等一下再聊。"             # a last line for stop(say=...), like the medicine line
 
 
 def pcm(seconds, level=8000):
@@ -48,7 +55,7 @@ async def until(condition, seconds=10.0):
 class Chat:
     """A LiveChat on fakes: the server's end of the socket, the robot and Reachy's voice."""
 
-    def __init__(self, connect_error=None, live_audio=True, speaker=True):
+    def __init__(self, connect_error=None, live_audio=True, speaker=True, speech_start=None):
         self.clock = FakeClock()
         self.app = FakeApp(make_task([], reason="checkin", checkin=True), self.clock)
         self.robot = FakeRobot()
@@ -57,8 +64,9 @@ class Chat:
         self.socket = FakeSocket(stamp=lambda: self.robot.blocks)
         self.connected = []
         self.connect_error = connect_error
+        self.detector = speech_start
         self.live = LiveChat(self.app, self.robot, self.speaker, connect=self._connect, clock=self.clock.monotonic,
-                             sleep=no_wait, run_blocking=inline)
+                             sleep=no_wait, run_blocking=inline, speech_start=speech_start)
 
     async def _connect(self, url, headers):
         self.connected.append((url, headers))
@@ -69,9 +77,9 @@ class Chat:
     def start(self):
         return asyncio.create_task(self.live.run("task-1", "zh-TW"))
 
-    async def ready(self, conversation_id="c9"):
+    async def ready(self, conversation_id="c9", **fields):
         await until(lambda: self.socket.json_sent())
-        self.socket.serve({"type": "ready", "conversation_id": conversation_id})
+        self.socket.serve({"type": "ready", "conversation_id": conversation_id, **fields})
         await until(lambda: self.live.conversation_id == conversation_id)
 
     def sent(self):
@@ -541,6 +549,236 @@ def test_without_gestures_reachy_keeps_still():
 
     chat = run(scenario)
     assert not [call for call in chat.robot.calls if call.startswith("gesture")]
+
+
+# ── the companion chat: speech signals, the opening, a last line ─────────
+class FakeSpeechStart:
+    """SpeechStart stand-in: speech begins at a frame at least half full scale after a quieter one (the VAD's onset).
+    `fed` keeps the level of every frame it was given, as the chat gave it."""
+
+    def __init__(self):
+        self.fed = []
+        self._speech = False
+
+    @property
+    def speaking(self):
+        return self._speech
+
+    def accept(self, samples):
+        assert samples.dtype == np.float32 and len(samples) == FRAME_SAMPLES
+        level = round(float(np.max(np.abs(samples))), 2)
+        self.fed.append(level)
+        began = level >= 0.5 and not self._speech
+        self._speech = level >= 0.5
+        return began
+
+
+async def hear(chat, level):
+    """The microphone hears one 40 ms frame at `level` (its first channel), and the chat has taken it in."""
+    count = len(chat.detector.fed)
+    chat.robot.mic.append(mic_chunk(first=level, count=FRAME_SAMPLES))
+    await until(lambda: len(chat.detector.fed) == count + 1)
+
+
+def said(text):
+    """How many samples FakeSpeaker makes of a line said through the chat's say path (10 ms per character)."""
+    return sum(len(piece) for piece in chunks(text)) * RATE // 100
+
+
+def fake_sherpa(monkeypatch):
+    """sherpa_onnx as SpeechStart uses it (it is not installed here); returns the list of VoiceActivityDetectors built.
+    `speech[i]` is what is_speech_detected() answers after window i; every fourth window ends a segment."""
+    built = []
+
+    class VadModelConfig:
+        def __init__(self):
+            self.silero_vad = types.SimpleNamespace()
+            self.sample_rate = None
+
+    class VoiceActivityDetector:
+        def __init__(self, config, buffer_size_in_seconds):
+            self.config, self.buffer = config, buffer_size_in_seconds
+            self.windows, self.speech, self.segments, self.popped = [], [], [], 0
+            built.append(self)
+
+        def accept_waveform(self, samples):
+            self.windows.append(np.array(samples))
+            if len(self.windows) % 4 == 0:
+                self.segments.append(types.SimpleNamespace(samples=np.zeros(VAD_WINDOW, np.float32)))
+
+        def is_speech_detected(self):
+            index = len(self.windows) - 1
+            return index < len(self.speech) and self.speech[index]
+
+        def empty(self):
+            return not self.segments
+
+        def pop(self):
+            self.segments.pop(0)
+            self.popped += 1
+
+    module = types.ModuleType("sherpa_onnx")
+    module.VadModelConfig, module.VoiceActivityDetector = VadModelConfig, VoiceActivityDetector
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", module)
+    return built
+
+
+def test_the_voice_detector_is_the_listeners_vad_and_says_where_speech_begins(tmp_path, monkeypatch):
+    built = fake_sherpa(monkeypatch)
+    (tmp_path / "silero_vad.onnx").write_bytes(b"x")
+    detector = SpeechStart(tmp_path)
+    vad, = built
+    silero = vad.config.silero_vad
+    assert silero.model == str(tmp_path / "silero_vad.onnx")
+    assert (silero.min_silence_duration, silero.min_speech_duration, silero.max_speech_duration) == (
+        MIN_SILENCE_SECONDS, MIN_SPEECH_SECONDS, 8.0)
+    assert (vad.config.sample_rate, vad.buffer) == (16000, 30)
+    vad.speech = [False, False, True, True, True, False, True]       # after each window: speech begins at 2 and 6
+    frame = np.full(FRAME_SAMPLES, 0.1, np.float32)                   # 640 samples: 1.25 of the VAD's windows
+    assert [detector.accept(frame) for _ in range(6)] == [False, False, True, False, False, True]
+    assert len(vad.windows) == 7 and all(len(window) == VAD_WINDOW for window in vad.windows)
+    assert np.all(np.concatenate(vad.windows) == np.float32(0.1))
+    assert vad.popped == 1 and vad.segments == []                     # its finished segments never pile up
+
+
+def test_the_opening_is_said_in_reachys_own_voice_before_anything_else():
+    async def scenario():
+        chat = Chat(speech_start=FakeSpeechStart())
+        task = chat.start()
+        await chat.ready(speech_text=OPENING)
+        for _ in range(3):
+            await hear(chat, 0.75)                                    # the patient talks over the greeting
+        await until(lambda: len(chat.robot.heard()) >= said(OPENING))
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        return chat, await task
+
+    chat, outcome = run(scenario)
+    assert outcome == LiveOutcome("ended", "goodbye", "c9", False)
+    assert chat.speaker.synthesised == chunks(OPENING)
+    heard = chat.robot.heard()
+    assert list(heard[heard != 0]) == [8192] * said(OPENING)          # the opening, and nothing else
+    assert all(not np.any(np.frombuffer(frame, "<i2")) for frame in chat.socket.frames_sent())
+    assert chat.detector.fed == [0.0] * 3                             # the detector hears what the server gets
+    assert {"type": "speech"} not in chat.sent() and chat.live.last_speech_at is None
+    assert [call for call in chat.robot.calls if call.startswith("gesture")][:1] == ["gesture:speak"]
+
+
+def test_speech_goes_to_the_server_when_the_patient_begins_to_speak_never_on_reachys_own_sound():
+    async def scenario():
+        chat = Chat(speech_start=FakeSpeechStart())
+        task = chat.start()
+        await chat.ready()
+        seen = []
+
+        async def onset():
+            await hear(chat, 0.75)
+            seen.append((chat.sent().count({"type": "speech"}), chat.live.last_speech_at))
+            await hear(chat, 0.25)
+
+        await onset()                                                 # 1000.0: the patient begins to speak
+        chat.clock.t += SPEECH_SIGNAL_GAP_SECONDS                     # (the gap never holds a signal back below)
+        chat.socket.serve(pcm(0.4))                                   # GPT-Live answers: Reachy makes sound
+        await until(lambda: chat.robot.pushed)
+        await onset()                                                 # 1001.0: its own voice, heard back
+        await until(lambda: len(chat.robot.pushed) == 20)
+        chat.clock.t += SPEECH_ECHO_GUARD_SECONDS - 0.05
+        await onset()                                                 # 1001.7: just under the guard: still its echo
+        chat.clock.t += 0.05
+        await onset()                                                 # 1001.75: at the guard: the patient again
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        await task
+        return chat, seen
+
+    chat, seen = run(scenario)
+    assert (SPEECH_ECHO_GUARD_SECONDS, SPEECH_SIGNAL_GAP_SECONDS) == (0.75, 1.0)
+    assert seen[:3] == [(1, 1000.0)] * 3
+    assert seen[3] == (2, pytest.approx(1001.0 + SPEECH_ECHO_GUARD_SECONDS))
+    assert chat.detector.fed == [0.75, 0.25] * 4                      # it hears every frame: only the signal waits
+    assert len(chat.socket.frames_sent()) == 8
+
+
+def test_a_failing_voice_detector_is_logged_once_and_the_chat_goes_on(caplog):
+    class Failing(FakeSpeechStart):
+        def accept(self, samples):
+            super().accept(samples)
+            raise RuntimeError("detector broke")
+
+    async def scenario():
+        chat = Chat(speech_start=Failing())
+        task = chat.start()
+        await chat.ready()
+        await hear(chat, 0.75)
+        chat.robot.mic.append(mic_chunk(first=0.0, count=FRAME_SAMPLES))   # the chat still sends what the mic hears
+        await until(lambda: len(chat.socket.frames_sent()) == 2)
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        return chat, await task
+
+    with caplog.at_level("WARNING"):
+        chat, outcome = run(scenario)
+    assert outcome == LiveOutcome("ended", "goodbye", "c9", False)    # not a robot_error fallback
+    assert chat.detector.fed == [0.75]                                # not called again after the failure
+    assert {"type": "speech"} not in chat.sent() and len(chat.socket.frames_sent()) == 2
+    assert [r.levelname for r in caplog.records if "voice detector" in r.getMessage()] == ["WARNING"]
+
+
+def test_speech_goes_to_the_server_at_most_once_a_second():
+    async def scenario():
+        chat = Chat(speech_start=FakeSpeechStart())
+        task = chat.start()
+        await chat.ready()
+        await hear(chat, 0.75)                                        # at 1000.0: signalled
+        await hear(chat, 0.25)
+        chat.clock.t += 0.5
+        await hear(chat, 0.75)                                        # at 1000.5: heard, not signalled
+        middle = (chat.sent().count({"type": "speech"}), chat.live.last_speech_at)
+        await hear(chat, 0.25)
+        chat.clock.t += 0.5
+        await hear(chat, 0.75)                                        # at 1001.0: a second after the signal
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        await task
+        return chat, middle
+
+    chat, middle = run(scenario)
+    assert middle == (1, 1000.5)
+    assert chat.sent().count({"type": "speech"}) == 2 and chat.live.last_speech_at == 1001.0
+
+
+def test_a_companion_chat_has_no_length_limit_on_the_robot():
+    async def scenario():
+        chat = Chat()
+        task = chat.start()
+        await chat.ready(speech_text=OPENING)
+        chat.clock.t += MAX_SECONDS
+        await asyncio.sleep(3 * POLL_SECONDS)                         # the chat looks at its limits meanwhile
+        going_on = not task.done()
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        return chat, going_on, await task
+
+    chat, going_on, outcome = run(scenario)
+    assert going_on and outcome == LiveOutcome("ended", "goodbye", "c9", False)
+    assert {"type": "end", "reason": "max_length"} not in chat.sent()
+
+
+def test_stop_with_a_last_line_lets_reachy_finish_its_sentence_then_says_the_line():
+    async def scenario():
+        chat = Chat()
+        task = chat.start()
+        await chat.ready()
+        chat.socket.serve(pcm(0.4))                                   # GPT-Live's sentence
+        await until(lambda: len(chat.robot.pushed) >= 5)
+        chat.live.stop("medicine", say=LAST_LINE)
+        chat.socket.serve(pcm(0.4, level=3000))                       # after the stop: never played
+        return chat, await task
+
+    chat, outcome = run(scenario)
+    assert outcome == LiveOutcome("ended", "medicine", "c9")
+    assert chat.speaker.synthesised == chunks(LAST_LINE)
+    heard = chat.robot.heard()
+    assert list(heard[heard != 0]) == [8000] * 6400 + [8192] * said(LAST_LINE)   # all of both, in that order
+    assert [message for message in chat.sent() if message["type"] == "end"] == [{"type": "end", "reason": "medicine"}]
+    assert chat.socket.stamp_of({"type": "end", "reason": "medicine"}) < chat.robot.pushed_at[20]   # sent at once
+    assert "clear_live_audio" not in chat.robot.calls
+    assert chat.robot.calls[-2:] == ["gesture:None", "stop_live_audio"]
 
 
 # ── the real WebSocket client (websockets) ───────────────────────────────

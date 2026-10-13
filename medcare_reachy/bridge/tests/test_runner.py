@@ -166,6 +166,22 @@ def test_a_lower_stream_rate_keeps_its_schedule_on_a_15_fps_camera():
     assert len(app.frames) == 30                                       # 2 frames in 3, not every other one
 
 
+def test_a_companion_session_slows_the_stream_and_gives_the_rate_back(caplog):
+    stream, app, camera, clock = make_server_stream()
+    stream.set_max_fps(2.0)
+    with caplog.at_level("WARNING", logger="medcare_reachy.bridge.runner"):
+        stream_camera(stream, clock, [50 + i / 15 for i in range(45)])    # 3 s of a 15 fps camera
+    assert len(app.frames) == 7 and camera.grabs == 45                     # about one every 0.5 s
+    assert all(0.39 < b[3] - a[3] < 0.6 for a, b in zip(app.frames, app.frames[1:]))
+    assert not stall_lines(caplog)                                         # slow on purpose: no stall
+    stream.set_max_fps(None)
+    app.frames.clear()
+    stream_camera(stream, clock, [53.5 + i / 15 for i in range(45)])  # 3 s more, at the full rate again
+    assert len(app.frames) == 45
+    stream.set_max_fps(30.0)                                           # never faster than the stream's own rate
+    assert stream.interval == 1 / 15
+
+
 def test_after_the_camera_stalls_the_stream_does_not_burst_to_catch_up():
     stream, app, camera, clock = make_server_stream()
     times = [50 + i / 15 for i in range(15)] + [52 + i / 30 for i in range(30)]   # 1 s stall, then 30 fps
@@ -470,9 +486,13 @@ class StubSlot:
     def __init__(self):
         self.stopped = None
         self.task = {"microphone": True}
+        self.medicine = 0
 
     def stop(self, reason, abort=True):
         self.stopped = (reason, abort)
+
+    def medicine_due(self):
+        self.medicine += 1
 
 
 def heartbeat_runner(app):
@@ -487,9 +507,22 @@ def test_heartbeat_payload_and_stop_all():
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert app.payloads == [{"robot_reachable": True, "landmark_fps": 14.8, "vision_fps": 4.9,
-                             "bridge_version": __version__, "missing_clips": 2}]
+                             "bridge_version": __version__, "missing_clips": 2, "companion": False}]
     assert app.cameras == [StubCamera.SNAPSHOT]
     assert runner.slot.stopped == ("stop_all", True)
+
+
+def test_the_heartbeat_says_companion_while_the_slot_is_in_a_companion_session():
+    app = HeartbeatApp({"stop_all": False})
+    runner = heartbeat_runner(app)
+    runner.slot = StubSlot()
+    runner.slot.companion_since = 12.5
+    asyncio.run(runner.heartbeat_once())
+    runner.slot.companion_since = None
+    asyncio.run(runner.heartbeat_once())
+    runner.slot = None
+    asyncio.run(runner.heartbeat_once())
+    assert [payload["companion"] for payload in app.payloads] == [True, False, False]
 
 
 def test_every_heartbeat_asks_for_media_a_refused_recovery_left_released():
@@ -521,6 +554,20 @@ def test_heartbeat_microphone_consent_reaches_the_running_slot():
     runner.slot = StubSlot()
     asyncio.run(runner.heartbeat_once())
     assert runner.slot.task["microphone"] is False and runner.slot.stopped is None
+
+
+def test_a_due_medicine_task_reaches_the_running_slot():
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False, "task_due": True}))
+    runner.slot = StubSlot()
+    asyncio.run(runner.heartbeat_once())
+    assert runner.slot.medicine == 1 and runner.slot.stopped is None
+    for answer in ({"stop_all": False, "task_due": False}, {"stop_all": False}):   # none due; an older server
+        runner = heartbeat_runner(HeartbeatApp(answer))
+        runner.slot = StubSlot()
+        asyncio.run(runner.heartbeat_once())
+        assert runner.slot.medicine == 0
+    runner = heartbeat_runner(HeartbeatApp({"stop_all": False, "task_due": True}))
+    assert asyncio.run(runner.heartbeat_once()) == {"stop_all": False, "task_due": True}   # no slot: nothing to end
 
 
 class TaskApp:

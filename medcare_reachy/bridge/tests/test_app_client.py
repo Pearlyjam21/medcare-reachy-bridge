@@ -299,6 +299,22 @@ def test_heartbeat_sends_the_camera_only_when_given():
     assert bodies == [{"robot_reachable": True}, {"robot_reachable": True, "camera": camera}]
 
 
+def test_a_companion_check_in_says_so_and_a_plain_one_sends_what_it_always_did():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"conversation_id": "c1", "reply": "你好", "speech_text": "你好"})
+
+    async def scenario():
+        async with make_client(handler) as client:
+            await client.conversation_start("t1", "zh-TW", companion=True)
+            await client.conversation_start("t1", "en")
+
+    run(scenario())
+    assert bodies == [{"task_id": "t1", "language": "zh-TW", "companion": True}, {"task_id": "t1", "language": "en"}]
+
+
 @pytest.mark.parametrize("base_url, expected", [
     ("http://app:8001", "ws://app:8001/api/device/conversations/live"),
     ("http://192.168.137.1:8001/", "ws://192.168.137.1:8001/api/device/conversations/live"),

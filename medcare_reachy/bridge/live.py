@@ -7,11 +7,20 @@ listener (voice.py) must be paused meanwhile, and no clip may play: play_clip re
 
 Messages (JSON text frames carry a "type"; binary frames are PCM16 mono at 16 kHz, both ways):
 - robot -> server: start {task_id, language, rate, bridge_version}; then 40 ms microphone frames (silence while
-  Reachy says a line of its own); playing / idle when Reachy's speaker starts and stops making sound; end {reason}
-  when the robot ends the chat itself.
-- server -> robot: ready {conversation_id}; GPT-Live's voice; flush (drop what is queued, now); say {speech_text,
-  reason} (Reachy says it with its own Matcha voice, through the same queue); fallback {reason, conversation_id};
-  end {reason, risk}.
+  Reachy says a line of its own); playing / idle when Reachy's speaker starts and stops making sound; speech when the
+  robot's own voice detector hears the patient begin to speak (a companion chat, below); end {reason} when the robot
+  ends the chat itself.
+- server -> robot: ready {conversation_id, speech_text} (speech_text only from the companion relay: Reachy's opening,
+  which it says itself); GPT-Live's voice; flush (drop what is queued, now); say {speech_text, reason} (Reachy says
+  it with its own Matcha voice, through the same queue); paused (GPT-Live was closed until the patient speaks again);
+  not_seen (a speech signal changed nothing: the camera has not recognised the patient lately); fallback {reason,
+  conversation_id}; end {reason, risk}.
+
+A companion chat (spec 2026-10-12 companion session, robot app 0.9.0): the server starts it paused and answers ready
+with Reachy's opening; GPT-Live starts only after a speech signal. The signals come from SpeechStart (silero VAD with
+the speech listener's settings) on the frames the server gets, never while Reachy makes sound or within
+SPEECH_ECHO_GUARD_SECONDS after it, at most one per SPEECH_SIGNAL_GAP_SECONDS. Such a chat has no length limit on the robot
+(MAX_SECONDS): it lasts until the patient's goodbye or the robot's own ending (stop(), with a last line or without).
 
 Ported from the TCU companion (reachy-mini-tcu, companion/audio/reachy_audio.py, base.py, protected_playback.py and
 companion/session.py): the paced playback loop with absolute deadlines, the prebuffer that waits again after an
@@ -27,12 +36,14 @@ import math
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 
 from medcare_reachy.bridge import __version__
 from medcare_reachy.bridge.media import resample
 from medcare_reachy.bridge.speech import chunks
+from medcare_reachy.bridge.voice import STT_FILES, VAD_WINDOW, make_vad
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +70,13 @@ DRAIN_LIMIT_SECONDS = 30.0     # after the server's end or fallback the queue (t
 MAX_SECONDS = 660.0            # the server ends a chat at 600 s (LIVE_MAX_SECONDS); this only guards against it not
 MIC_IDLE_SECONDS = 0.005       # no microphone samples yet: look again after this (TCU reachy_audio.py:94)
 LATE_RESET_SECONDS = 0.1       # the speaker's clock this late: start afresh, never burst (TCU reachy_audio.py:125)
+# Companion chat (spec 4.3): at most one 'speech' to the server this often. None goes while Reachy makes sound, nor
+# within SPEECH_ECHO_GUARD_SECONDS of the last block with sound pushed to its speaker.
+SPEECH_SIGNAL_GAP_SECONDS = 1.0
+# Reachy's own sound reaches the voice detector up to about the SDK's playback delay (~0.22 s after the push, see the
+# latency notes above) + the echo's own tail (voice.MUTE_TAIL_SECONDS, 0.35 s) + the microphone delay (~0.17 s) after
+# the push of its last block with sound.
+SPEECH_ECHO_GUARD_SECONDS = 0.75
 
 # What a queued sound is: GPT-Live's voice, Reachy's own line, Reachy's own line said without moving.
 LIVE, SAY, STILL = "live", "say", "still"
@@ -228,43 +246,103 @@ class WebSocket:
             log.debug("live chat: closing the WebSocket failed", exc_info=True)
 
 
+class SpeechStart:
+    """A companion chat's own voice detector (spec 4.3): silero VAD with the speech listener's settings
+    (voice.make_vad: its model file and timings), telling where the patient begins to speak.
+
+    accept() takes float32 samples at 16 kHz, any number at a time, and is True for the call in which speech began
+    (the VAD says so after voice.MIN_SPEECH_SECONDS of it, and speech ends after voice.MIN_SILENCE_SECONDS of quiet);
+    `speaking` is the VAD's state after the last call: it hears speech now.
+    sherpa_onnx (on the robot; not in this repo's test environment) is imported only when one is built: building one
+    raises ImportError without it, and FileNotFoundError without the model file (voice.STT_FILES in `models_dir`)."""
+
+    def __init__(self, models_dir: Path):
+        models_dir = Path(models_dir)
+        missing = [name for name in STT_FILES if not (models_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(f"the voice detector needs {', '.join(missing)} in {models_dir}")
+        self._vad = make_vad(models_dir)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._speech = False
+
+    def accept(self, samples: np.ndarray) -> bool:
+        self._pending = np.concatenate([self._pending, np.asarray(samples, dtype=np.float32)])
+        began = False
+        while len(self._pending) >= VAD_WINDOW:
+            self._vad.accept_waveform(self._pending[:VAD_WINDOW])
+            self._pending = self._pending[VAD_WINDOW:]
+            speech = bool(self._vad.is_speech_detected())
+            began = began or (speech and not self._speech)
+            self._speech = speech
+        while not self._vad.empty():   # its finished segments aren't needed: dropped, or they would pile up
+            self._vad.pop()
+        return began
+
+    @property
+    def speaking(self) -> bool:
+        return self._speech
+
+
 class LiveChat:
     """One live check-in: run() opens the WebSocket, streams the microphone, plays what comes back, and returns how it
-    ended. Use each LiveChat once. stop() ends it from outside (the task stopped, the bridge shuts down).
+    ended. Use each LiveChat once. stop() ends it from outside (the task stopped, the bridge shuts down; with a last
+    line: Reachy rests, or a medicine is due).
 
     `connect(url, headers)` opens the socket (default: connect_websocket); `clock` paces the speaker and times the
-    limits; `sleep` and `run_blocking` (robot calls, Matcha) are replaced in the tests; `gestures`: the settings
-    page's check-in gestures switch (Reachy's "speak" gesture while it makes sound, still during the help line).
+    limits; `sleep` and `run_blocking` (robot calls, Matcha, the voice detector) are replaced in the tests;
+    `gestures`: the settings page's check-in gestures switch (Reachy's "speak" gesture while it makes sound, still
+    during the help line); `speech_start`: a companion chat's voice detector (a SpeechStart; None: no 'speech' to the
+    server). `last_speech_at` (on `clock`) is when that detector last heard the patient begin to speak while Reachy
+    made no sound, and `last_voice_at` the last frame on which it heard the patient speaking (its speech state, not
+    an onset) while Reachy made no sound; None until then. `closing` is True once the chat's ending is decided (the
+    server's end or fallback, a dropped connection, the robot's own ending) and what is queued plays out.
     """
 
     def __init__(self, app, robot, speaker, *, connect=None, clock=time.monotonic, sleep=asyncio.sleep,
-                 run_blocking=asyncio.to_thread, gestures=True):
+                 run_blocking=asyncio.to_thread, gestures=True, speech_start=None):
         self.app, self.robot, self.speaker = app, robot, speaker
         self._connect = connect or connect_websocket
         self.clock, self._sleep, self._run_blocking = clock, sleep, run_blocking
         self.gestures = gestures
+        self.speech_start = speech_start
         self.player = Player()
         self.conversation_id: str | None = None
         self.frames_sent = 0          # microphone frames sent
         self.dropped_audio = 0        # frames of GPT-Live's voice that came while Reachy said its own line
+        self.last_speech_at: float | None = None
+        self.last_voice_at: float | None = None
+        self.closing = False
         self._socket = None
         self._inbox: asyncio.Queue = asyncio.Queue()   # the server's messages; None once the connection closed
         self._ready = False
+        self._companion = False       # the server's 'ready' carried Reachy's opening: the companion relay
         self._stop_reason: str | None = None
+        self._last_line: str | None = None   # stop(say=...): Reachy's last line
+        self._last_line_queued = False       # ... queued when the chat ended: the final drain plays it out
         self._workers: list[asyncio.Task] = []
         self._says: set[asyncio.Task] = set()
         self._saying = 0              # Reachy's own lines still being synthesised
         self._say_tail = 0            # blocks the microphone still stays silent after Reachy's own line
+        self._sound_at: float | None = None    # when the last block with sound went to the speaker
+        self._signal_at: float | None = None   # when the last 'speech' went to the server
         self._playing = False         # 'playing' was reported, 'idle' not yet
         self._quiet = 0               # blocks without sound since the last one with sound
         self._gesture_mode: str | None = None
         self._speaker_lock = asyncio.Lock()   # a flush never lands between taking a block and pushing it
 
-    def stop(self, reason: str) -> None:
-        """End the chat now: run() drops what is queued, tells the server `end {reason}` and returns an "ended"
-        outcome. Call it on the chat's event loop (the bridge's stop paths run there)."""
+    def stop(self, reason: str, say: str | None = None) -> None:
+        """End the chat now: run() tells the server `end {reason}` and returns an "ended" outcome. Call it on the
+        chat's event loop (the bridge's stop paths run there); only the first call counts.
+
+        Without `say`, what is queued is dropped at once. With `say` (Reachy's last line, in the voice's Simplified
+        characters), what is queued still plays (Reachy finishes its sentence), then Reachy says the line through the
+        same queue; `end` goes to the server at once, so GPT-Live says nothing more, and run() returns once the line
+        has played (DRAIN_LIMIT_SECONDS at most). Once `closing` is set (the server ended the chat or fell back: its
+        final drain plays its help line) the session asks for no companion ending (medicine, rest, a lost voice
+        detector or camera); a stop that still comes then (stop_all, the app shutting down) cuts that drain, with or
+        without a line, and its line is not said."""
         if self._stop_reason is None:
-            self._stop_reason = reason
+            self._stop_reason, self._last_line = reason, say
             self._inbox.put_nowait(_STOP)
 
     async def run(self, task_id: str, language: str) -> LiveOutcome:
@@ -291,6 +369,7 @@ class LiveChat:
                              asyncio.create_task(self._mic_loop(), name="live-microphone"),
                              asyncio.create_task(self._play_loop(), name="live-speaker")]
             outcome, drain = await self._converse()
+            self.closing = True
             if drain:
                 await self._drain()
             if self._stop_reason is not None and not (outcome.kind == "ended" and outcome.reason == self._stop_reason):
@@ -322,9 +401,13 @@ class LiveChat:
         while True:
             ending = self._robot_ending(started)
             if ending is not None:
-                await self._flush(report=False)
+                if self._stop_reason is not None and self._last_line is not None:
+                    self._start_say(self._last_line, self._stop_reason)   # after what is queued
+                    self._last_line_queued = True
+                else:
+                    await self._flush(report=False)
                 await self._send({"type": "end", "reason": ending.reason})
-                return ending, False
+                return ending, self._last_line_queued
             try:
                 message = await asyncio.wait_for(self._inbox.get(), POLL_SECONDS)
             except asyncio.TimeoutError:
@@ -344,7 +427,7 @@ class LiveChat:
 
     def _robot_ending(self, started: float) -> LiveOutcome | None:
         """Whether the robot ends the chat itself now: stop(), a failed audio or socket loop, no answer to 'start', or
-        MAX_SECONDS."""
+        MAX_SECONDS (not in a companion chat: it lasts until the patient's goodbye or the robot's own ending)."""
         if self._stop_reason is not None:
             return LiveOutcome("ended", self._stop_reason, self.conversation_id)
         for task in self._workers:
@@ -355,7 +438,7 @@ class LiveChat:
         if not self._ready and elapsed >= READY_TIMEOUT:
             log.warning("live chat: no answer from the server within %.0f s; Reachy uses the text chat", READY_TIMEOUT)
             return LiveOutcome("fallback", NO_ANSWER, None)
-        if elapsed >= MAX_SECONDS:
+        if elapsed >= MAX_SECONDS and not self._companion:
             return LiveOutcome("ended", MAX_LENGTH, self.conversation_id)
         return None
 
@@ -370,10 +453,22 @@ class LiveChat:
             self.conversation_id = None if conversation_id is None else str(conversation_id)
             self._ready = True
             log.info("live chat %s: ready", self.conversation_id)
+            opening = message.get("speech_text")
+            if isinstance(opening, str) and opening.strip():
+                # The companion relay: Reachy greets in its own voice first; GPT-Live starts when the patient answers
+                self._companion = True
+                self._start_say(opening, "opening")
         elif kind == "flush":
             await self._flush()
         elif kind == "say":
             self._start_say(message.get("speech_text"), message.get("reason"))
+        elif kind == "paused":
+            # GPT-Live was closed until the patient speaks again. What it said still plays out; Reachy's "speak"
+            # gesture ends with its sound, as after every reply (_after_block), so it holds still and listens.
+            log.info("live chat %s: paused until the patient speaks again", self.conversation_id)
+        elif kind == "not_seen":
+            log.info("live chat %s: the patient's voice did not restart GPT-Live: not seen by the camera lately",
+                     self.conversation_id)
         elif kind == "fallback":
             conversation_id = message.get("conversation_id") or self.conversation_id   # never lose the stored turns
             return LiveOutcome("fallback", str(message.get("reason") or "fallback"),
@@ -405,7 +500,7 @@ class LiveChat:
     def _start_say(self, text, reason) -> None:
         pieces = chunks(text if isinstance(text, str) else None)
         if not pieces or self.speaker is None or not self.speaker.available:
-            log.warning("live chat %s: Reachy cannot say the server's %s line (no voice or no text)",
+            log.warning("live chat %s: Reachy cannot say its %s line (no voice or no text)",
                         self.conversation_id, reason)
             return
         self._saying += 1
@@ -434,7 +529,8 @@ class LiveChat:
     async def _mic_loop(self) -> None:
         """The microphone to the server in FRAME_SAMPLES frames, from 'ready' on (nothing would hear them before), and
         silence instead while Reachy says its own line. The microphone's own pace paces the stream, which GPT-Live
-        needs: no input audio, no output (spike robot-audio.md section 4)."""
+        needs: no input audio, no output (spike robot-audio.md section 4). Each frame sent also goes to the voice
+        detector (_listen)."""
         pending = np.zeros(0, dtype="<i2")
         while True:
             chunk = await self._run_blocking(self.robot.get_audio)
@@ -450,7 +546,42 @@ class LiveChat:
                     if not await self._socket.send(frame.tobytes()):
                         return   # the connection closed: _converse ends the chat
                     self.frames_sent += 1
+                    await self._listen(frame)
             await self._sleep(0)
+
+    async def _listen(self, frame: np.ndarray) -> None:
+        """A companion chat's voice detector on one frame the server got (spec 4.3): `speech` to the server when the
+        patient begins to speak, unless Reachy may be hearing itself (_hearing), at most one per
+        SPEECH_SIGNAL_GAP_SECONDS. The detector hears every frame, Reachy's own sound too: only the signal waits."""
+        if self.speech_start is None:
+            return
+        try:
+            onset = await self._run_blocking(self.speech_start.accept, frame.astype(np.float32) / 32768)
+        except Exception as error:
+            log.warning("live chat %s: the voice detector failed (%s); no more speech signals in this chat",
+                        self.conversation_id, type(error).__name__)
+            self.speech_start = None
+            return
+        if not self._hearing():
+            return
+        now = self.clock()
+        if self.speech_start.speaking:
+            self.last_voice_at = now   # the patient speaks (the medicine ending waits for their words)
+        if not onset:
+            return
+        self.last_speech_at = now
+        if self._signal_at is not None and now - self._signal_at < SPEECH_SIGNAL_GAP_SECONDS:
+            return
+        self._signal_at = now
+        await self._send({"type": "speech"})
+
+    def _hearing(self) -> bool:
+        """Whether a voice the microphone hears now is the patient's: Reachy says no line of its own (the microphone
+        sends silence then, and SAY_TAIL_BLOCKS after it), and no block with sound went to its speaker within
+        SPEECH_ECHO_GUARD_SECONDS (its echo)."""
+        if self._say_active() or self._say_tail:
+            return False
+        return self._sound_at is None or self.clock() - self._sound_at >= SPEECH_ECHO_GUARD_SECONDS
 
     async def _play_loop(self) -> None:
         """One block every BLOCK_SECONDS on an absolute-deadline clock (silence when nothing may play), as TCU's
@@ -475,6 +606,7 @@ class LiveChat:
             self._say_tail -= 1
         if kind is not None and int(np.abs(block.astype(np.int32)).max()) > ONSET_LEVEL:
             self._quiet = 0
+            self._sound_at = self.clock()
             self._set_gesture(None if kind == STILL else "speak")
             if not self._playing:
                 self._playing = True
@@ -501,13 +633,14 @@ class LiveChat:
                 await self._send({"type": "idle"})
 
     async def _drain(self) -> None:
-        """After the server's end or fallback, or a dropped connection, nothing more comes: what is queued (Reachy's
-        help line above all) plays now without waiting for the buffer, for DRAIN_LIMIT_SECONDS at most, until stop()."""
+        """After the server's end or fallback, a dropped connection, or a stop() with a last line, nothing more comes:
+        what is queued (Reachy's help line or last line above all) plays now without waiting for the buffer, for
+        DRAIN_LIMIT_SECONDS at most, until a stop() that comes meanwhile (a last line is never cut so)."""
         self.player.finish()
         deadline = self.clock() + DRAIN_LIMIT_SECONDS
         speaker = self._workers[2]
         while ((self._saying or self.player.queued) and self.clock() < deadline and not speaker.done()
-               and self._stop_reason is None):
+               and (self._stop_reason is None or self._last_line_queued)):
             await self._sleep(BLOCK_SECONDS)
 
     def _set_gesture(self, mode: str | None) -> None:

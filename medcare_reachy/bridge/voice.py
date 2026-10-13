@@ -210,8 +210,21 @@ _whisper_models: dict = {}
 _whisper_models_lock = threading.Lock()
 
 
-def _speech_models(models_dir: Path, language: str):
+def make_vad(models_dir: Path):
+    """silero VAD (sherpa_onnx) with the listener's settings. The live chat's voice detector (live.SpeechStart) is
+    built here too, so both hear speech begin and end alike."""
     import sherpa_onnx
+
+    config = sherpa_onnx.VadModelConfig()
+    config.silero_vad.model = str(models_dir / "silero_vad.onnx")
+    config.silero_vad.min_silence_duration = MIN_SILENCE_SECONDS
+    config.silero_vad.min_speech_duration = MIN_SPEECH_SECONDS
+    config.silero_vad.max_speech_duration = 8.0
+    config.sample_rate = SAMPLE_RATE
+    return sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=30)
+
+
+def _speech_models(models_dir: Path, language: str):
     from faster_whisper import WhisperModel
 
     key = str(models_dir)
@@ -221,13 +234,7 @@ def _speech_models(models_dir: Path, language: str):
                 "base", device="cpu", compute_type="int8", cpu_threads=2,
                 download_root=str(models_dir / "whisper"))
         recognizer = _whisper_models[key]
-    config = sherpa_onnx.VadModelConfig()
-    config.silero_vad.model = str(models_dir / "silero_vad.onnx")
-    config.silero_vad.min_silence_duration = MIN_SILENCE_SECONDS
-    config.silero_vad.min_speech_duration = MIN_SPEECH_SECONDS
-    config.silero_vad.max_speech_duration = 8.0
-    config.sample_rate = SAMPLE_RATE
-    vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=30)
+    vad = make_vad(models_dir)
 
     def transcribe(segment: np.ndarray) -> str:
         chunks, _ = recognizer.transcribe(
