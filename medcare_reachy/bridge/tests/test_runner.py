@@ -1,5 +1,6 @@
 import asyncio
 
+import httpx
 import numpy as np
 
 from medcare_reachy.bridge import __version__
@@ -683,6 +684,97 @@ def test_after_failing_closed_on_app_loss_the_held_task_is_resumed_via_tasks_cur
     runner._pause = no_pause
     asyncio.run(runner._task_loop())
     assert app.calls == ["tasks_current", "slot", "tasks_current", "tasks_current", "slot", "tasks_next"]
+
+
+# ── the server as the runner sees it (the settings page's "server" block) ──
+SERVER = "http://10.192.135.67:8001"
+
+
+def connect_timeout(request):
+    """AppUnreachable as AppClient raises it for an httpx timeout (`raise ... from exc`)."""
+    error = AppUnreachable(f"{request}: ConnectTimeout('')")
+    error.__cause__ = httpx.ConnectTimeout("")
+    return error
+
+
+def startup_lines(caplog, step):
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith(f"[STARTUP] {step}:")]
+
+
+def test_a_failed_server_streak_is_logged_once_and_reported_to_the_status_page(caplog):
+    """When the laptop's address changed, the app logged "heartbeat failed: ... ConnectTimeout('')" every 10 s and
+    nothing else, and the status page kept saying running (14 Oct 2026)."""
+    app = HeartbeatApp({"stop_all": False})
+    clock, clips = Clock(), FakeClips()
+    clips.missing_count = 0
+    runner = Runner(app=app, robot=FakeRobot(), clips=clips, stream=StubStream(), run_blocking=inline,
+                    clock=clock, server_url=SERVER)
+    assert runner.server_status() == {"url": SERVER, "reachable": False, "last_ok_seconds_ago": None,
+                                      "unreachable_for_seconds": None, "last_error": None}
+    with caplog.at_level("INFO", logger="medcare_reachy.bridge.runner"):
+        asyncio.run(runner.heartbeat_once())
+        clock.t += 10
+        app.error = connect_timeout("POST /api/device/heartbeat")
+        for _ in range(3):
+            asyncio.run(runner.heartbeat_once())
+            clock.t += 10
+        down = runner.server_status()
+        app.error = None
+        asyncio.run(runner.heartbeat_once())
+    assert down == {"url": SERVER, "reachable": False, "last_ok_seconds_ago": 40.0, "unreachable_for_seconds": 30.0,
+                    "last_error": "ConnectTimeout: POST /api/device/heartbeat"}
+    assert runner.server_status() == {"url": SERVER, "reachable": True, "last_ok_seconds_ago": 0.0,
+                                      "unreachable_for_seconds": None,
+                                      "last_error": "ConnectTimeout: POST /api/device/heartbeat"}
+    assert startup_lines(caplog, "server") == [
+        f"[STARTUP] server: reachable at {SERVER}",
+        f"[STARTUP] server: cannot reach {SERVER} (ConnectTimeout: POST /api/device/heartbeat)",
+        f"[STARTUP] server: reachable at {SERVER}"]
+    assert sum("heartbeat failed" in r.getMessage() for r in caplog.records) == 3   # each failure still has its line
+    assert startup_lines(caplog, "robot") == ["[STARTUP] robot: reachable (the SDK has its connection to the daemon)"]
+
+
+def test_a_failed_task_poll_names_its_request_and_a_rejected_key_still_counts_as_reachable(caplog):
+    class LoopApp:
+        def __init__(self):
+            self.answers = [connect_timeout("GET /api/device/tasks/current"), None,
+                            NotAuthorised(status=403, detail="revoked"), AppUnreachable("x: HTTP 502", 502)]
+            self.unreachable_since = None
+
+        async def tasks_current(self):
+            return self._answer()
+
+        async def tasks_next(self, wait):
+            return self._answer()
+
+        def _answer(self):
+            if not self.answers:
+                runner.stopping.set()
+                return None
+            answer = self.answers.pop(0)
+            if answer is not None:
+                raise answer
+            return None
+
+    async def no_pause(seconds):
+        return None
+
+    runner = Runner(app=LoopApp(), robot=FakeRobot(), clips=FakeClips(), stream=FakeStream(), run_blocking=inline,
+                    clock=Clock(), server_url=SERVER)
+    runner._pause = no_pause
+    with caplog.at_level("INFO", logger="medcare_reachy.bridge.runner"):
+        asyncio.run(runner._task_loop())
+    # tasks/current timed out, then answered; tasks/next: the key was rejected (the server answered), a 502, then
+    # an answer again.
+    assert startup_lines(caplog, "server") == [
+        f"[STARTUP] server: cannot reach {SERVER} (ConnectTimeout: GET /api/device/tasks/current)",
+        f"[STARTUP] server: reachable at {SERVER}",
+        f"[STARTUP] server: cannot reach {SERVER} (HTTP 502: GET /api/device/tasks/next)",
+        f"[STARTUP] server: reachable at {SERVER}"]
+    assert runner.server_status()["reachable"] is True
+    assert runner.server_status()["last_error"] == "HTTP 502: GET /api/device/tasks/next"
+    assert runner_module._failure(AppUnreachable("x"), "GET /api/device/tasks/next") == \
+        "AppUnreachable: GET /api/device/tasks/next"   # no cause and no status: the exception's own name
 
 
 # ── emotion scored on the robot ──

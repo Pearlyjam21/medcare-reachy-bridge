@@ -104,3 +104,41 @@ def test_a_video_file_robot_has_no_live_audio(tmp_path):
     robot.clear_live_audio()
     robot.stop_live_audio()
     assert robot.actions == []
+
+
+# ── the SDK's continuous timestamps (LIVE_PTS_RESYNC_SECONDS) ──
+def test_a_push_that_fell_behind_is_preceded_by_silence_for_the_gap():
+    """Measured 13 Oct 2026: blocks 0.1-0.2 s behind the SDK's timeline stay behind and the speaker drops them all
+    (the silent chats); fill_live_audio() pushes the gap as silence so the next block is on time."""
+    mini = Mini(Media())
+    robot = ReachyRobot.attach(mini)
+    clock = [100.0]
+    robot._now = lambda: clock[0]
+    robot.start_live_audio()
+    robot.push_audio(np.full(320, 0.25, np.float32))        # the timeline: the next block is due at 100.02
+    assert robot.fill_live_audio() == 0.0                    # not behind
+    clock[0] = 100.17                                        # 150 ms behind
+    assert robot.fill_live_audio() == pytest.approx(0.15, abs=1 / 16000)
+    assert len(mini.media.pushed) == 2 and len(mini.media.pushed[1]) == 2400 and not np.any(mini.media.pushed[1])
+    robot.push_audio(np.full(320, 0.25, np.float32))        # on time again: the timeline continues
+    assert robot._live_next_at == pytest.approx(100.17 + 0.02, abs=1e-3)
+    assert robot.fill_live_audio() == 0.0
+
+
+def test_a_gap_the_sdk_resyncs_by_itself_is_not_filled_and_a_flush_anchors_afresh():
+    mini = Mini(Media())
+    robot = ReachyRobot.attach(mini)
+    clock = [100.0]
+    robot._now = lambda: clock[0]
+    robot.start_live_audio()
+    robot.push_audio(np.zeros(320, np.float32))
+    clock[0] = 100.32                                        # 300 ms behind: over LIVE_PTS_RESYNC_SECONDS
+    assert robot.fill_live_audio() == 0.0 and len(mini.media.pushed) == 1
+    robot.push_audio(np.zeros(320, np.float32))              # the SDK anchors at now; so does the facade
+    assert robot._live_next_at == pytest.approx(100.34, abs=1e-6)
+    robot.clear_live_audio()                                 # clear_player(): afresh at the next push
+    assert robot._live_next_at is None and robot.fill_live_audio() == 0.0
+    clock[0] = 200.0
+    robot.push_audio(np.zeros(320, np.float32))
+    assert robot._live_next_at == pytest.approx(200.02, abs=1e-6)
+    assert ReachyRobot.attach(Mini(Media())).fill_live_audio() == 0.0   # nothing pushed yet: nothing to fill

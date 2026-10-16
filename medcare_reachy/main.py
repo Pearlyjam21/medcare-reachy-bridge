@@ -10,9 +10,12 @@ import threading
 
 from reachy_mini import ReachyMini, ReachyMiniApp
 
+from medcare_reachy.bridge import __version__
 from medcare_reachy.service import BridgeService
 from medcare_reachy.settings_store import SettingsStore
 from medcare_reachy.web import register_routes
+
+log = logging.getLogger("medcare_reachy")
 
 
 class MedcareReachy(ReachyMiniApp):
@@ -29,6 +32,10 @@ class MedcareReachy(ReachyMiniApp):
 
     def run(self, reachy_mini: ReachyMini, stop_event: threading.Event):
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+        # The steps that follow each log one [STARTUP] line (service.py, bridge/runner.py): the settings file, the
+        # models, the robot, the voice, and the first answer from the server, with the reason when one fails.
+        log.info("[STARTUP] medcare_reachy %s: the app runtime handed over the robot; the settings page and "
+                 "/api/status are served by it at %s", __version__, self.custom_app_url)
         self.service.attach(reachy_mini)
         self.service.start()   # does nothing until the settings page has a server address and robot key
         try:

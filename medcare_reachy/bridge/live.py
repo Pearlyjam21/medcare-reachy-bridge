@@ -14,7 +14,12 @@ Messages (JSON text frames carry a "type"; binary frames are PCM16 mono at 16 kH
   which it says itself); GPT-Live's voice; flush (drop what is queued, now); say {speech_text, reason} (Reachy says
   it with its own Matcha voice, through the same queue); paused (GPT-Live was closed until the patient speaks again);
   not_seen (a speech signal changed nothing: the camera has not recognised the patient lately); fallback {reason,
-  conversation_id}; end {reason, risk}.
+  conversation_id}; end {reason, risk}; and, from 0.11.0, the GPT-Live agent's tool requests (the server's
+  agent_bridge): camera {request_id}, answered with frame {request_id, jpeg (base64), width, height, captured_at}
+  or {request_id, error}; emote {request_id, preset}, answered with emote_result {request_id, ok, result | error};
+  emotion {request_id}, answered with emotion_result {request_id, available, fused, fer, ser, ter, branches ...}
+  (multimodal/engine.py report(), the engine session.py hands the chat as `mood`). The camera and the emotes run on
+  reachy_hardware.ReachyMiniHardware (the camera worker, the motion worker), never on the audio loops.
 
 A companion chat (spec 2026-10-12 companion session, robot app 0.9.0): the server starts it paused and answers ready
 with Reachy's opening; GPT-Live starts only after a speech signal. The signals come from SpeechStart (silero VAD with
@@ -30,6 +35,7 @@ element an app can reach; a flush cuts at once).
 """
 
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -69,6 +75,7 @@ POLL_SECONDS = 0.1             # how often the chat looks at its time limits and
 DRAIN_LIMIT_SECONDS = 30.0     # after the server's end or fallback the queue (the help line) plays, this long at most
 MAX_SECONDS = 660.0            # the server ends a chat at 600 s (LIVE_MAX_SECONDS); this only guards against it not
 MIC_IDLE_SECONDS = 0.005       # no microphone samples yet: look again after this (TCU reachy_audio.py:94)
+HARDWARE_STOP_SECONDS = 6.0  # the chat's end waits this long for a running emote to finish (reachy_hardware.shutdown)
 LATE_RESET_SECONDS = 0.1       # the speaker's clock this late: start afresh, never burst (TCU reachy_audio.py:125)
 # Companion chat (spec 4.3): at most one 'speech' to the server this often. None goes while Reachy makes sound, nor
 # within SPEECH_ECHO_GUARD_SECONDS of the last block with sound pushed to its speaker.
@@ -299,8 +306,11 @@ class LiveChat:
     """
 
     def __init__(self, app, robot, speaker, *, connect=None, clock=time.monotonic, sleep=asyncio.sleep,
-                 run_blocking=asyncio.to_thread, gestures=True, speech_start=None):
+                 run_blocking=asyncio.to_thread, gestures=True, speech_start=None, hardware=None):
         self.app, self.robot, self.speaker = app, robot, speaker
+        self.hardware = hardware      # reachy_hardware.ReachyMiniHardware for the server's tool requests; None: refused
+        self.mood = None              # the multimodal emotion engine (session.py sets it), for the emotion request
+        self._requests: set[asyncio.Task] = set()   # the tool requests being answered
         self._connect = connect or connect_websocket
         self.clock, self._sleep, self._run_blocking = clock, sleep, run_blocking
         self.gestures = gestures
@@ -327,6 +337,8 @@ class LiveChat:
         self._signal_at: float | None = None   # when the last 'speech' went to the server
         self._playing = False         # 'playing' was reported, 'idle' not yet
         self._quiet = 0               # blocks without sound since the last one with sound
+        self.late_fills = 0           # times the speaker's clock fell LATE_RESET_SECONDS behind and silence filled the gap
+        self._expressed = False       # the server set a posture (`express`): lifted when the chat ends
         self._gesture_mode: str | None = None
         self._speaker_lock = asyncio.Lock()   # a flush never lands between taking a block and pushing it
 
@@ -377,17 +389,29 @@ class LiveChat:
                 # end keeps its flag
                 outcome = LiveOutcome("ended", self._stop_reason, self.conversation_id,
                                       outcome.kind == "ended" and outcome.risk)
-            log.info("live chat %s: %s (%s); %d microphone frames sent, %d underruns, buffer %.1f s",
+            log.info("live chat %s: %s (%s); %d microphone frames sent, %d underruns, buffer %.1f s, %d late fills",
                      self.conversation_id, outcome.kind, outcome.reason, self.frames_sent, self.player.underruns,
-                     self.player.target)
+                     self.player.target, self.late_fills)
             return outcome
         finally:
-            tasks = [*self._workers, *self._says]
+            tasks = [*self._workers, *self._says, *self._requests]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             if self._socket is not None:
                 await self._socket.close()
+            if self.hardware is not None:
+                # The chat's emotes end with it: an emote still running finishes its gotos (bounded), and the
+                # adapter's workers are closed, so the session's own moves after the chat never race a gesture
+                try:
+                    await asyncio.wait_for(self.hardware.shutdown(), HARDWARE_STOP_SECONDS)
+                except Exception:
+                    log.exception("live chat: the hardware adapter did not stop cleanly")
+            if self._expressed:
+                try:
+                    self.robot.express(None)   # the chat's posture ends with it
+                except Exception:
+                    log.exception("live chat: the posture could not be lifted")
             self._set_gesture(None)
             try:
                 await self._run_blocking(self.robot.stop_live_audio)
@@ -469,6 +493,18 @@ class LiveChat:
         elif kind == "not_seen":
             log.info("live chat %s: the patient's voice did not restart GPT-Live: not seen by the camera lately",
                      self.conversation_id)
+        elif kind == "camera":
+            self._start_request(self._camera_request(message))
+        elif kind == "emote":
+            self._start_request(self._emote_request(message))
+        elif kind == "emotion":
+            self._start_request(self._emotion_request(message))
+        elif kind == "dance":
+            self._start_request(self._dance_request(message))
+        elif kind == "stop_dance":
+            self._start_request(self._stop_dance_request(message))
+        elif kind == "express":
+            self._start_request(self._express_request(message))
         elif kind == "fallback":
             conversation_id = message.get("conversation_id") or self.conversation_id   # never lose the stored turns
             return LiveOutcome("fallback", str(message.get("reason") or "fallback"),
@@ -479,6 +515,126 @@ class LiveChat:
         else:
             log.warning("live chat: ignored a message it does not know (%s)", kind or "not a JSON object")
         return None
+
+    # ── the GPT-Live agent's tool requests (reachy_hardware) ─────────────
+    def _start_request(self, coroutine) -> None:
+        task = asyncio.create_task(coroutine, name="live-tool-request")
+        self._requests.add(task)
+        task.add_done_callback(self._requests.discard)
+
+    async def _camera_request(self, message: dict) -> None:
+        """A fresh frame for the server's camera tool, as a JPEG in base64 (the camera worker, then encode)."""
+        answer = {"type": "frame", "request_id": message.get("request_id")}
+        if self.hardware is None:
+            answer["error"] = "no_camera"
+        else:
+            try:
+                jpeg, frame = await self.hardware.capture_jpeg()
+                answer.update(jpeg=base64.b64encode(jpeg).decode("ascii"), width=frame.width, height=frame.height,
+                              captured_at=frame.captured_at_monotonic)
+            except Exception as error:
+                log.warning("live chat %s: the camera tool request failed (%s)", self.conversation_id,
+                            type(error).__name__)
+                answer["error"] = (str(error) or type(error).__name__)[:80]
+        await self._send(answer)
+
+    async def _emote_request(self, message: dict) -> None:
+        """Queue an emote for the server's gesture tool and answer at once; refused when the settings page's
+        check-in gestures switch is off (as Reachy's speaking gesture is), or without the hardware adapter."""
+        answer = {"type": "emote_result", "request_id": message.get("request_id"), "ok": False}
+        if self.hardware is None:
+            answer["error"] = "no_motion"
+        elif not self.gestures:
+            answer["error"] = "gestures_off"
+        else:
+            try:
+                result = await self.hardware.trigger_emote(str(message.get("preset") or ""))
+                answer.update(ok=True, result=result)
+            except Exception as error:
+                answer["error"] = (str(error) or type(error).__name__)[:80]
+        await self._send(answer)
+
+    async def _dance_request(self, message: dict) -> None:
+        """Start a recorded dance for the server's dance tool and answer at once (the dance runs on the motion
+        worker); refused like an emote without the hardware adapter or with the check-in gestures switch off."""
+        wanted = message.get("dance")
+        log.info("[TOOL] dance called: dance=%s repeat=%s", wanted or "any", message.get("repeat") or 1)
+        answer = {"type": "dance_result", "request_id": message.get("request_id"), "ok": False}
+        if self.hardware is None:
+            answer["error"] = "no_motion"
+        elif not self.gestures:
+            answer["error"] = "gestures_off"
+        else:
+            try:
+                repeat = int(message.get("repeat") or 1)
+            except (TypeError, ValueError):
+                repeat = 1
+            try:
+                result = await self.hardware.start_dance(str(wanted) if wanted else None, repeat)
+                answer.update(ok=True, result=result)
+            except Exception as error:
+                answer["error"] = (str(error) or type(error).__name__)[:120]
+        await self._send(answer)
+
+    async def _express_request(self, message: dict) -> None:
+        """Reachy's body language for what the conversation carries (the server's affect reading of the patient's
+        words, or its play_emotion tool): `affect` sets the sustained posture ("concern", "joy", or null to lift it;
+        absent: unchanged), `move` plays one of the SDK's recorded emotion moves once, on the motion worker. Only
+        a message with a request_id is answered (express_result). Nothing moves with the check-in gestures switch
+        off, as for the emotes."""
+        affect, move = message.get("affect", "unchanged"), message.get("move")
+        log.info("[EXPRESS] affect=%s move=%s (%s)", affect, move or "-", message.get("reason") or "server")
+        answer = {"type": "express_result", "request_id": message.get("request_id"), "ok": False}
+        if not self.gestures:
+            answer["error"] = "gestures_off"
+        else:
+            try:
+                if affect != "unchanged":
+                    posture = None if affect in (None, "neutral", "") else str(affect)
+                    self.robot.express(posture)
+                    self._expressed = self._expressed or posture is not None
+                result = {"affect": affect}
+                if move:
+                    if self.hardware is None:
+                        raise RuntimeError("no_motion")
+                    result["move"] = await self.hardware.play_emotion(str(move))
+                answer.update(ok=True, result=result)
+            except Exception as error:
+                log.warning("live chat %s: the expression failed (%s)", self.conversation_id,
+                            (str(error) or type(error).__name__)[:120])
+                answer["error"] = (str(error) or type(error).__name__)[:120]
+        if message.get("request_id") is not None:
+            await self._send(answer)
+
+    async def _stop_dance_request(self, message: dict) -> None:
+        """Stop the dance playing now (or queued) for the server's stop_dance tool."""
+        log.info("[TOOL] stop_dance called")
+        answer = {"type": "dance_result", "request_id": message.get("request_id"), "ok": False}
+        if self.hardware is None:
+            answer["error"] = "no_motion"
+        else:
+            try:
+                answer.update(ok=True, result=await self.hardware.stop_dance())
+            except Exception as error:
+                answer["error"] = (str(error) or type(error).__name__)[:120]
+        await self._send(answer)
+
+    async def _emotion_request(self, message: dict) -> None:
+        """The robot's multimodal emotion for the server's emotion tool: the engine's report (multimodal/engine.py:
+        the last fused face, voice and text result and each branch's status), off the loop; `available` false
+        without an engine."""
+        answer = {"type": "emotion_result", "request_id": message.get("request_id"), "available": False}
+        report = getattr(self.mood, "report", None)
+        if callable(report):
+            try:
+                answer.update(await self._run_blocking(report))
+            except Exception as error:
+                log.warning("live chat %s: the emotion tool request failed (%s)", self.conversation_id,
+                            type(error).__name__)
+                answer["error"] = (str(error) or type(error).__name__)[:80]
+        else:
+            answer["error"] = "no_emotion_engine"
+        await self._send(answer)
 
     def _audio(self, pcm: bytes) -> None:
         if self._say_active():
@@ -595,8 +751,20 @@ class LiveChat:
             next_tick += BLOCK_SECONDS
             now = self.clock()
             if now - next_tick > LATE_RESET_SECONDS:
-                next_tick = now
-            await self._sleep(max(0.0, next_tick - now))
+                # Start afresh, never burst the missed blocks. The SDK keeps its playback timestamps continuous, so
+                # the next blocks would stay this late and the speaker would drop every one of them (the silent chats
+                # of 13 Oct 2026, media.LIVE_PTS_RESYNC_SECONDS): the gap goes to the speaker as silence first
+                async with self._speaker_lock:
+                    try:
+                        filled = await self._run_blocking(self.robot.fill_live_audio)
+                    except Exception:
+                        log.exception("live chat %s: the speaker's gap could not be filled", self.conversation_id)
+                        filled = 0.0
+                if filled:
+                    self.late_fills += 1
+                next_tick = self.clock()
+            else:
+                await self._sleep(max(0.0, next_tick - now))
 
     async def _after_block(self, block: np.ndarray, kind: str | None) -> None:
         """'playing' at the first block with sound, 'idle' IDLE_QUIET_BLOCKS after the last one; the gestures follow."""

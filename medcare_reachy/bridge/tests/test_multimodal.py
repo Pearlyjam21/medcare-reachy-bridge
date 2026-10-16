@@ -242,3 +242,35 @@ def test_streamed_frames_are_scored_without_landmarks():
     mood, model = make_engine()
     report = mood.score(FRAME, None, BOX)
     assert report["face_index"] is None and model.calls == [BOX]
+
+
+def test_report_gives_the_live_agent_the_fused_result_and_every_branch():
+    """The GPT-Live agent's emotion tool (bridge/live.py emotion request): the last fused result with its age, the
+    voice and text branches' latest output (stale past VOICE_TTL), which branches exist; JSON-safe throughout."""
+    import json
+
+    now = {"t": 100.0}
+    speech, text = FakeSpeech("sad"), FakeText("sad")
+    mood, _ = make_engine(speech, text, clock=lambda: now["t"])
+    before = mood.report()
+    assert before["available"] is False and before["fused"] is None and before["active"] is False
+    assert before["fer"] == {"status": "no_frame_scored"} and before["ser"] == {"status": "silence"}
+    assert before["ter"] == {"status": "no_transcript"} and before["branches"] == {"face": True, "speech": True,
+                                                                                   "text": True}
+    mood.begin(7)
+    mood.hear(np.zeros(16000, np.float32), 99.0, 100.0, "我好難過")
+    mood.score(FRAME, PACKET, BOX)
+    now["t"] = 103.0
+    report = mood.report()
+    assert report["available"] and report["active"] and report["fused"]["top"] == "sad"
+    assert set(report["fused"]["used"]) == {"face", "speech", "text"} and report["fused"]["age_seconds"] == 3.0
+    assert set(report["fused"]["probabilities"]) == set(SERVER_LABELS)
+    assert report["fused"]["confidence"] == max(report["fused"]["probabilities"].values())
+    assert report["ser"]["status"] == "ok" and report["ser"]["top"] == "sad" and report["ser"]["confidence"] == 0.8
+    assert report["ter"]["status"] == "ok" and set(report["ter"]["probabilities"]) == set(SERVER_LABELS)
+    json.dumps(report)
+    now["t"] = 111.0                                             # VOICE_TTL (10 s) has passed: the voice is stale
+    stale = mood.report()
+    assert stale["ser"]["status"] == "stale" and stale["ter"]["status"] == "stale" and "top" in stale["ser"]
+    face_only, _ = make_engine()
+    assert face_only.report()["ser"] == {"status": "off"} and face_only.report()["branches"]["speech"] is False

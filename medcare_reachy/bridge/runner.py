@@ -48,6 +48,14 @@ def _no_media_status() -> None:
     return None
 
 
+def _failure(exc: BridgeError, request: str) -> str:
+    """A failed server request as one short line for the status page: the transport error's name (ConnectTimeout,
+    ConnectError) or the HTTP status, then the request, e.g. "ConnectTimeout: POST /api/device/heartbeat"."""
+    cause = exc.__cause__
+    what = f"HTTP {exc.status}" if exc.status else type(cause if cause is not None else exc).__name__
+    return f"{what}: {request}"
+
+
 def encode_stream_jpeg(frame) -> bytes:
     """BGR camera frame -> its 4:3 centre at STREAM_SIZE as a JPEG, for the server-side landmark stream.
 
@@ -498,16 +506,23 @@ class MonitorStream:
 class Runner:
     def __init__(self, *, app, robot, clips, stream, voice=None, speaker=None, language="zh-TW",
                  heartbeat_seconds=HEARTBEAT_SECONDS, tick_seconds=TICK_SECONDS, run_blocking=asyncio.to_thread,
-                 ack=True, gestures=True, mood=None, follow=None):
+                 ack=True, gestures=True, mood=None, follow=None, clock=time.monotonic, server_url=None):
         self.app, self.robot, self.clips, self.stream, self.voice = app, robot, clips, stream, voice
         self.speaker, self.language, self.mood, self.follow = speaker, language, mood, follow
         self.ack, self.gestures = ack, gestures   # check-in 「嗯」 and body language (SlotSession)
         self.heartbeat_seconds = heartbeat_seconds
         self.tick_seconds = tick_seconds
         self.run_blocking = run_blocking
+        self.clock = clock
         self.slot: SlotSession | None = None
         self.stopping = asyncio.Event()
         self.robot_reachable: bool | None = None
+        # The server as the heartbeat and the task poll last saw it (server_status(), the settings page). When the
+        # laptop's address changed, both loops only logged a timeout every 10-15 s while the page said "running".
+        self.server_url = server_url               # the settings page's server address, for the log and the status
+        self.server_ok_at: float | None = None     # when the server last answered a heartbeat or a task poll (clock)
+        self.server_error: str | None = None       # the last failure, e.g. "ConnectTimeout: POST /api/device/heartbeat"
+        self.server_fail_since: float | None = None   # when the current streak of failures began; None while reachable
 
     def request_shutdown(self) -> None:
         """Process exit: leave the task leased so it is resumed (tasks/current) or re-queued on lease expiry."""
@@ -541,6 +556,7 @@ class Runner:
         # failing closed on app loss: the lease is still ours, so tasks/next would never return it.
         check_current = True
         while not self.stopping.is_set():
+            request = "GET /api/device/tasks/current" if check_current else "GET /api/device/tasks/next"
             try:
                 if check_current:
                     task = await self.app.tasks_current()
@@ -548,13 +564,16 @@ class Runner:
                 else:
                     task = await self.app.tasks_next(TASK_WAIT)
             except NotAuthorised as exc:
+                self._server_ok()   # the server answered: it is the key that is wrong, not the address
                 log.error("device token rejected (%s); pair the robot again or restore consent", exc.detail)
                 await self._pause(60)
                 continue
             except BridgeError as exc:
+                self._server_failed(exc, request)
                 log.warning("task poll failed: %s", exc)
                 await self._pause(5)
                 continue
+            self._server_ok()
             if task:
                 slot = await self.run_slot(task)
                 check_current = slot.result in RESUMABLE
@@ -564,6 +583,32 @@ class Runner:
             await asyncio.wait_for(self.stopping.wait(), seconds)
         except asyncio.TimeoutError:
             pass
+
+    # ── the server as this runner sees it ────────────────────────────────
+    def _server_ok(self) -> None:
+        """A heartbeat or a task poll the server answered: one INFO line at the first, and after every streak of
+        failures."""
+        if self.server_ok_at is None or self.server_fail_since is not None:
+            log.info("[STARTUP] server: reachable at %s", self.server_url)
+        self.server_ok_at, self.server_fail_since = self.clock(), None
+
+    def _server_failed(self, exc: BridgeError, request: str) -> None:
+        """A heartbeat or a task poll that failed: one WARNING when a streak begins, not every 10 s (the loops' own
+        lines say each failure)."""
+        self.server_error = _failure(exc, request)
+        if self.server_fail_since is None:
+            self.server_fail_since = self.clock()
+            log.warning("[STARTUP] server: cannot reach %s (%s)", self.server_url, self.server_error)
+
+    def server_status(self) -> dict:
+        """For the settings page (service.status()): whether the server answers, and since or for how long."""
+        now = self.clock()
+        return {"url": self.server_url,
+                "reachable": self.server_ok_at is not None and self.server_fail_since is None,
+                "last_ok_seconds_ago": None if self.server_ok_at is None else round(now - self.server_ok_at, 1),
+                "unreachable_for_seconds": (None if self.server_fail_since is None
+                                            else round(now - self.server_fail_since, 1)),
+                "last_error": self.server_error}
 
     async def run_slot(self, task: dict) -> SlotSession:
         log.info("task %s (%s): %d dose(s)", task.get("task_id"), task.get("reason"), len(task.get("doses", [])))
@@ -588,10 +633,14 @@ class Runner:
         return slot
 
     async def heartbeat_once(self) -> dict | None:
+        first = self.robot_reachable is None
         try:
             self.robot_reachable = bool(await self.run_blocking(self.robot.is_reachable))
         except Exception:
             self.robot_reachable = False
+        if first:
+            log.info("[STARTUP] robot: %s", "reachable (the SDK has its connection to the daemon)" if self.robot_reachable
+                     else "unreachable (the SDK could not connect to the daemon; see the warning above)")
         if self.robot_reachable:
             # A camera recovery the daemon refused leaves this app's media released, the speaker and the microphone
             # with it, and outside a stalled session nothing else asks for it back (restore_media never raises).
@@ -608,8 +657,10 @@ class Runner:
         except NotAuthorised:
             response = {"stop_all": True, "microphone": False}   # revoked device or withdrawn consent
         except BridgeError as exc:
+            self._server_failed(exc, "POST /api/device/heartbeat")
             log.warning("heartbeat failed: %s", exc)
             return None
+        self._server_ok()
         if response.get("stop_all") and self.slot:
             log.warning("stop_all from app: stopping the current slot")
             self.slot.stop("stop_all")

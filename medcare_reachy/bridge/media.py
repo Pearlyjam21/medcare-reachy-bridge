@@ -43,6 +43,23 @@ LIVE_RATE = 16000   # the live chat's audio (bridge/live.py): the robot's own ra
 # stop_live_audio(): the SDK still plays what the live chat pushed last, about 0.17 s through its pipeline plus its
 # 50 ms sink buffer (audio_gstreamer.py PLAYBACK_SINK_BUFFER_TIME_US); the next clip waits that out.
 LIVE_TAIL_SECONDS = 0.3
+# The SDK keeps its playback timestamps continuous from one push to the next, unless a push comes more than this
+# long after the end of the previous block (reachy_mini 1.8.3 audio_base.AudioBase.GAP_RESET_NS): then it starts the
+# timeline afresh at the pipeline's running time. Blocks that fall behind by less than this stay behind for good,
+# and the speaker drops every one of them once the lag passes its ~100 ms of latency. Measured on 13 Oct 2026
+# through the ALSA loopback: after a 105-150 ms stall of the live chat's loop the rest of the chat was silent (the
+# chats of 19:56 and 22:43 that day); after a 300 ms stall the SDK re-anchored and the sound came back.
+# fill_live_audio() covers such a gap with silence, so the next block is on time again.
+LIVE_PTS_RESYNC_SECONDS = 0.2
+# The SDK's recorded moves (reachy_mini.motion.recorded_move.RecordedMoves): Hugging Face datasets the daemon keeps
+# in its cache on the robot. "dance": 19 moves of 1.8-5 s (chicken_peck, jackson_square, side_to_side_sway...);
+# "emotion": Pollen's 85 emotion moves of 2-20 s with their own sounds (downcast1, calming1, cheerful1...), played
+# here without the sounds. The emotion cache held empty files on 13 Oct 2026 until it was downloaded again.
+MOVE_LIBRARIES = {"dance": "pollen-robotics/reachy-mini-dances-library",
+                  "emotion": "pollen-robotics/reachy-mini-emotions-library"}
+DANCE_LIBRARY = MOVE_LIBRARIES["dance"]
+DANCE_RATE_HZ = 100.0        # how often a move's trajectory is sent (the SDK's play_move plays at 100 Hz)
+DANCE_START_SECONDS = 0.5    # the goto to a move's first pose before its trajectory starts
 
 
 class Robot(Protocol):
@@ -62,8 +79,13 @@ class Robot(Protocol):
     # The live chat (bridge/live.py) owns the speaker from start_live_audio() to stop_live_audio(); no clip plays then.
     def start_live_audio(self) -> bool: ...   # False: no speaker now
     def push_audio(self, samples: np.ndarray) -> bool: ...   # one block, float32 mono at LIVE_RATE, not waited for
+    def fill_live_audio(self) -> float: ...   # the chat's loop fell behind: silence for the gap; the seconds pushed
     def clear_live_audio(self) -> None: ...   # drop what the speaker still has queued
     def stop_live_audio(self) -> None: ...
+    # The GPT-Live agent's dances and emotion moves (bridge/reachy_hardware.py): the SDK's recorded moves.
+    def move_names(self, library: str) -> dict[str, str]: ...   # {name: description} the library has here; {}
+    def play_move(self, library: str, name: str, should_stop) -> str: ...   # blocking: "completed" / "cancelled"
+    def express(self, affect: str | None) -> None: ...   # a sustained posture under the gestures (gestures.AFFECTS)
 
 
 def crop_4_3(frame: np.ndarray) -> np.ndarray:
@@ -155,6 +177,11 @@ class ReachyRobot:
         self._recording_media = None    # get_audio(): the media manager whose microphone this app has started
         self._recording_retry_at = 0.0  # get_audio(): after a failed start, when to try again
         self._recording_failed = False  # get_audio(): a failed start is already logged
+        # push_audio(): when the SDK's playback timeline (its continuous timestamps) expects the next block, on
+        # self._now; None once start_playing() or clear_player() made the next push anchor it afresh
+        self._live_next_at: float | None = None
+        self._libraries: dict = {}      # the SDK's RecordedMoves by MOVE_LIBRARIES key, loaded on first use
+        self._dancing = False           # play_move() runs: look_at() and gesture() leave the servos to it
         # Gestures start only after hold_head() and stop for every other move (wake, sleep, look_around, close).
         self._gestures = Gestures(self._send_gesture, ready=self._motors_on, start_from=self._start_pose,
                                   move=thinking_move())
@@ -269,6 +296,7 @@ class ReachyRobot:
             if media is None:
                 return False
             media.start_playing()
+            self._live_next_at = None   # start_playing() anchors the SDK's timeline afresh at the next push
             for start in range(0, len(samples), self.CHUNK):
                 media.push_audio_sample(samples[start:start + self.CHUNK])
             self._quiet_at = time.monotonic() + seconds
@@ -287,7 +315,17 @@ class ReachyRobot:
             if media is None:
                 return False
             media.start_playing()
+            self._live_next_at = None
         return True
+
+    def _follow_timeline(self, seconds: float) -> None:
+        """Keep step with the SDK's playback timeline across a push of `seconds` of audio: it continues from the
+        previous block unless the push comes LIVE_PTS_RESYNC_SECONDS after that block's end (then it starts afresh,
+        at now)."""
+        now = self._now()
+        if self._live_next_at is None or now - self._live_next_at > LIVE_PTS_RESYNC_SECONDS:
+            self._live_next_at = now
+        self._live_next_at += seconds
 
     def push_audio(self, samples: np.ndarray) -> bool:
         """One block of the live chat's audio (float32 mono at LIVE_RATE), handed to the speaker without waiting: the
@@ -298,18 +336,38 @@ class ReachyRobot:
                 return False
             samples = np.asarray(samples, dtype=np.float32)
             out_rate = int(media.get_output_audio_samplerate())
+            self._follow_timeline(len(samples) / LIVE_RATE)
             media.push_audio_sample(resample(samples, LIVE_RATE, out_rate))   # 16 kHz on the robot: no change
         return True
+
+    def fill_live_audio(self) -> float:
+        """The live chat's loop fell behind its clock (live.py LATE_RESET_SECONDS): push silence for the time the
+        SDK's timeline is behind now, so the next block is on time again, and return those seconds. 0.0 when the
+        timeline is not behind, or behind by more than LIVE_PTS_RESYNC_SECONDS (the SDK starts it afresh by itself at
+        the next push), or without media."""
+        with self._lock:
+            media = self._media()
+            if media is None or self._live_next_at is None:
+                return 0.0
+            lag = self._now() - self._live_next_at
+            if lag <= 0.0 or lag > LIVE_PTS_RESYNC_SECONDS:
+                return 0.0
+            count = int(lag * LIVE_RATE)
+            out_rate = int(media.get_output_audio_samplerate())
+            media.push_audio_sample(resample(np.zeros(count, np.float32), LIVE_RATE, out_rate))
+            self._live_next_at += count / LIVE_RATE
+            return count / LIVE_RATE
 
     def clear_live_audio(self) -> None:
         """Drop what the speaker still has queued (the live chat's flush), with the SDK's clear_player(). In reachy_mini
         1.11.0 that call is on the media manager's audio object (the manager has none): GStreamerAudio pauses its one
-        pipeline, flushes the player and plays again. Does nothing without media."""
+        pipeline, flushes the player and plays again (and anchors its timeline afresh). Does nothing without media."""
         with self._lock:
             media = self._media()
             clear = getattr(getattr(media, "audio", None), "clear_player", None)
             if clear is not None:
                 clear()
+                self._live_next_at = None
 
     def stop_live_audio(self) -> None:
         """The live chat is over. Never the SDK's stop_playing(): GStreamerAudio keeps the microphone and the speaker in
@@ -438,10 +496,18 @@ class ReachyRobot:
         """Check-in body language (gestures.py): "think", "speak", or None to come back to the neutral pose.
 
         Never blocks. Ignored until hold_head() has put the robot in the neutral pose; any other move (set_head,
-        look_around, wake, sleep, close) stops it first and ignores it again until the next hold_head().
+        look_around, wake, sleep, close) stops it first and ignores it again until the next hold_head(). Ignored
+        while a recorded move plays (play_move ends with hold_head).
         """
-        if self._mini is not None:
+        if self._mini is not None and not self._dancing:
             self._gestures.set(mode)
+
+    def express(self, affect: str | None) -> None:
+        """A sustained posture under the gestures (gestures.set_affect: "concern", "joy", or None for none), from
+        the live chat's `express` message. Never blocks; it fades in once the robot is placed in the neutral pose,
+        and stays through gestures and recorded moves until lifted."""
+        if self._mini is not None:
+            self._gestures.set_affect(affect)
 
     def _send_gesture(self, pose: Pose) -> None:
         head = head_pose(pose.yaw, pose.pitch, pose.roll)
@@ -501,6 +567,18 @@ class ReachyRobot:
             self._gestures.halt()
             self._mini.goto_target(head=pose, antennas=list(NEUTRAL_ANTENNAS), duration=duration, body_yaw=0.0)
 
+    def goto(self, pose: np.ndarray, antennas_deg: tuple[float, float] = (0.0, 0.0), duration: float = 0.5) -> None:
+        """One move of the head to `pose` (head_pose; its [:3, 3] is the position in metres) and of the antennas to
+        offsets from the neutral antennas in degrees ([right, left], as the gesture stream's Pose), over `duration`
+        seconds. Blocks until the move has ended (the SDK's goto_target), so call it from a worker thread
+        (reachy_hardware.py's motion worker). Stops the gesture stream like set_head; hold_head() lets it start
+        again from the neutral pose."""
+        if self._mini is not None:
+            self._gestures.halt()
+            antennas = [NEUTRAL_ANTENNAS[0] + math.radians(antennas_deg[0]),
+                        NEUTRAL_ANTENNAS[1] + math.radians(antennas_deg[1])]
+            self._mini.goto_target(head=pose, antennas=antennas, duration=max(0.2, float(duration)), body_yaw=0.0)
+
     def hold_head(self) -> None:
         self.set_head(head_pose(), duration=0.8)
         if self._mini is not None:
@@ -514,7 +592,7 @@ class ReachyRobot:
         the server's face box is in that 4:3 centre crop, the SDK's look_at_image wants a pixel of the camera's
         own image."""
         media = self._media()
-        if self._mini is None or media is None:
+        if self._mini is None or media is None or self._dancing:   # a dance has the servos until it ends
             return
         camera = getattr(media, "camera", None)
         width, height = (getattr(camera, "resolution", None) or (1280, 720))[:2]
@@ -525,6 +603,77 @@ class ReachyRobot:
         px, py = min(width - 1, max(1, px)), min(height - 1, max(1, py))
         self._gestures.halt()
         self._mini.look_at_image(px, py, duration=duration)
+
+    # ── the GPT-Live agent's dances and emotion moves (bridge/reachy_hardware.py) ──────────
+    def _library(self, library: str):
+        """The SDK's recorded moves of one MOVE_LIBRARIES entry, loaded once from the Hugging Face cache the daemon
+        keeps on the robot (RecordedMoves asks the network only when the cache lacks it)."""
+        if library not in MOVE_LIBRARIES:
+            raise ValueError(f"unknown move library {library}")
+        if library not in self._libraries:
+            from reachy_mini.motion.recorded_move import RecordedMoves   # lazy: the SDK and huggingface_hub
+
+            moves = RecordedMoves(MOVE_LIBRARIES[library])
+            valid = []
+            for name in moves.list_moves():   # a half-downloaded cache holds empty files: those are left out
+                try:
+                    moves.get(name)
+                    valid.append(name)
+                except Exception:
+                    log.warning("[MOVES] %s: %s is unreadable in the cache", library, name)
+            moves.moves = {name: moves.moves[name] for name in valid}
+            self._libraries[library] = moves
+            log.info("[MOVES] library %s (%s): %d moves", library, MOVE_LIBRARIES[library], len(valid))
+        return self._libraries[library]
+
+    def move_names(self, library: str) -> dict[str, str]:
+        """The recorded moves this robot has in `library` ("dance" or "emotion"), name -> the library's one-line
+        description; {} when it cannot be loaded (logged). Blocks on the first call (read from disk)."""
+        try:
+            moves = self._library(library)
+        except Exception as exc:
+            log.warning("[MOVES] the %s library is not available: %r", library, exc)
+            return {}
+        return {name: str((moves.moves.get(name) or {}).get("description") or "") for name in moves.list_moves()}
+
+    def dance_names(self) -> dict[str, str]:
+        return self.move_names("dance")
+
+    def play_dance(self, name: str, should_stop) -> str:
+        return self.play_move("dance", name, should_stop)
+
+    def play_move(self, library: str, name: str, should_stop) -> str:
+        """Play one recorded move, blocking for its length (call it from reachy_hardware's motion worker): the
+        gesture stream stops, the head goes to the move's first pose (DANCE_START_SECONDS), then its trajectory is
+        sent at DANCE_RATE_HZ with the SDK's set_target, as the SDK's own play_move does (without the move's sound:
+        GPT-Live's voice is the sound), until it ends or `should_stop()` says so. Face following and gestures leave
+        the servos alone meanwhile; it ends with hold_head(), the neutral pose, so they may start again (a posture
+        set with express() fades in again then). Returns "completed" or "cancelled". ValueError for a name the
+        library lacks, RuntimeError without a connection."""
+        if self._mini is None:
+            raise RuntimeError("no_robot")
+        move = self._library(library).get(name)   # ValueError when unknown
+        self._gestures.halt()
+        self._dancing = True
+        outcome = "cancelled"
+        try:
+            head, antennas, body_yaw = move.evaluate(0.0)
+            self._mini.goto_target(head=head, antennas=list(antennas), duration=DANCE_START_SECONDS,
+                                   body_yaw=float(body_yaw))
+            period = 1.0 / DANCE_RATE_HZ
+            started = time.monotonic()
+            while not should_stop():
+                elapsed = time.monotonic() - started
+                if elapsed >= move.duration:
+                    outcome = "completed"
+                    break
+                head, antennas, body_yaw = move.evaluate(min(elapsed, move.duration - 1e-2))
+                self._mini.set_target(head=head, antennas=list(antennas), body_yaw=float(body_yaw))
+                time.sleep(max(0.001, period - (time.monotonic() - started - elapsed)))
+        finally:
+            self._dancing = False
+            self.hold_head()
+        return outcome
 
     def wake(self) -> None:
         if self._mini is None:
@@ -588,17 +737,33 @@ class VideoFileRobot:
     def push_audio(self, samples: np.ndarray) -> bool:
         return False
 
+    def fill_live_audio(self) -> float:
+        return 0.0
+
     def clear_live_audio(self) -> None:
         pass
 
     def stop_live_audio(self) -> None:
         pass
 
+    def move_names(self, library: str) -> dict[str, str]:
+        return {}   # no move library without the SDK
+
+    def play_move(self, library: str, name: str, should_stop) -> str:
+        self.actions.append(("play_move", library, name))
+        return "completed"
+
+    def express(self, affect: str | None) -> None:
+        self.actions.append(("express", affect))
+
     def gesture(self, mode: str | None) -> None:
         self.actions.append(("gesture", mode))
 
     def set_head(self, pose, duration: float = 1.0) -> None:
         self.actions.append(("set_head",))
+
+    def goto(self, pose, antennas_deg=(0.0, 0.0), duration: float = 0.5) -> None:
+        self.actions.append(("goto", tuple(antennas_deg), duration))
 
     def hold_head(self) -> None:
         self.actions.append(("hold_head",))

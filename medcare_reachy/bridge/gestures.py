@@ -38,6 +38,19 @@ RECENTER_SECONDS = 0.9    # from a pose measured a little off neutral, the strea
 MOVE_AGAIN_SECONDS = 10.0  # thinking again sooner than this after the move started goes straight to the sway
 READY_CHECK_SECONDS = 1.0  # how often the stream checks that the motors are on
 MODES = ("think", "speak")
+# A sustained posture under the motions, for what the conversation carries (set_affect; live.py's `express` from the
+# server): "concern" while the patient is sad or worried, "joy" at good news. It fades in and out over
+# AFFECT_FADE_SECONDS, slower than a motion, and stays until the server lifts it, so Reachy keeps a caring tilt
+# through its own reply and the patient's next words, instead of one short animation.
+AFFECTS = ("concern", "joy")
+AFFECT_FADE_SECONDS = 1.5
+# Concern (degrees): the head sinks and tilts a little, looking down, the antennas droop (right +, left -: the
+# emote presets' droop, reachy_hardware.py) and breathe slowly; the head settles 3 mm lower.
+CONCERN_PITCH, CONCERN_ROLL, CONCERN_Z = 6.0, 5.0, -3.0
+CONCERN_ANTENNA, CONCERN_BREATH, CONCERN_BREATH_HZ = 14.0, 1.5, 0.12
+# Joy: the antennas perk up (right -, left +) and bounce for JOY_BOUNCE_SECONDS, the head lifts a little.
+JOY_PITCH, JOY_Z, JOY_ANTENNA = -3.0, 3.0, -16.0
+JOY_BOUNCE, JOY_BOUNCE_HZ, JOY_BOUNCE_SECONDS = 7.0, 1.4, 2.5
 
 # Thinking (degrees): the head tilts and looks a little up, the whole robot turns slowly to and fro, and the
 # antennas swing in mirror (Pollen's "breathing" pattern, slower).
@@ -48,7 +61,7 @@ THINK_ANTENNA, THINK_ANTENNA_HZ = 12.0, 0.3
 SPEAK_ANTENNA, SPEAK_ANTENNA_HZ = 8.0, 0.7
 # Hard limits on each offset from the neutral pose (degrees; the head's position in mm) for the sway and speaking.
 LIMITS = {"roll": 10.0, "pitch": 10.0, "yaw": 8.0, "body_yaw": 5.0, "right": 20.0, "left": 20.0,
-          "x": 0.0, "y": 0.0, "z": 0.0}
+          "x": 0.0, "y": 0.0, "z": 4.0}
 # The same while the recorded move plays. Its offsets from its first frame: head roll -6..17°, pitch -6..4°,
 # yaw -7..1°, body 0, right antenna 0, left antenna 0..100°, head position within 5 mm.
 MOVE_LIMITS = {"roll": 20.0, "pitch": 10.0, "yaw": 10.0, "body_yaw": 5.0, "right": 20.0, "left": 110.0,
@@ -80,6 +93,19 @@ def pattern(mode: str, t: float) -> Pose:
         phase = 2 * math.pi * SPEAK_ANTENNA_HZ * t
         return Pose(right=SPEAK_ANTENNA * math.sin(phase), left=SPEAK_ANTENNA * math.sin(phase + math.pi / 2))
     raise ValueError(f"unknown gesture {mode}")
+
+
+def affect_pattern(affect: str, t: float) -> Pose:
+    """The posture at full strength, `t` seconds after it was asked for."""
+    if affect == "concern":
+        breath = CONCERN_BREATH * math.sin(2 * math.pi * CONCERN_BREATH_HZ * t)
+        return Pose(roll=CONCERN_ROLL, pitch=CONCERN_PITCH + breath, right=CONCERN_ANTENNA, left=-CONCERN_ANTENNA,
+                    z=CONCERN_Z)
+    if affect == "joy":
+        # The bounce dies away over JOY_BOUNCE_SECONDS, then the antennas simply stay up
+        bounce = JOY_BOUNCE * max(0.0, 1 - t / JOY_BOUNCE_SECONDS) * math.sin(2 * math.pi * JOY_BOUNCE_HZ * t)
+        return Pose(pitch=JOY_PITCH, right=JOY_ANTENNA - bounce, left=-JOY_ANTENNA + bounce, z=JOY_Z)
+    raise ValueError(f"unknown affect {affect}")
 
 
 def smooth(level: float) -> float:
@@ -119,9 +145,11 @@ def easing_back(origin: Pose, t: float) -> Pose:
     return Pose(*(left * value for value in origin))
 
 
-def mix(levels: dict, t: float, motions: dict | None = None, limits: dict = LIMITS) -> Pose:
+def mix(levels: dict, t: float, motions: dict | None = None, limits: dict = LIMITS,
+        affect: tuple[str, float, float] | None = None) -> Pose:
     """The motions weighted by their fade levels; all levels at 0 is exactly the neutral pose. `motions` gives a
-    mode's pose at this moment in place of its pattern (the thinking move)."""
+    mode's pose at this moment in place of its pattern (the thinking move). `affect`: (posture, its level, seconds
+    since it was asked for), added under the motions."""
     total = [0.0] * len(Pose._fields)
     for mode, level in levels.items():
         if level > 0:
@@ -129,6 +157,10 @@ def mix(levels: dict, t: float, motions: dict | None = None, limits: dict = LIMI
             motion = (motions or {}).get(mode)
             for i, value in enumerate(pattern(mode, t) if motion is None else motion):
                 total[i] += weight * value
+    if affect is not None and affect[1] > 0:
+        weight = smooth(affect[1])
+        for i, value in enumerate(affect_pattern(affect[0], affect[2])):
+            total[i] += weight * value
     return Pose(*(max(-limits[name], min(limits[name], value)) for name, value in zip(Pose._fields, total)))
 
 
@@ -150,6 +182,10 @@ class Gestures:
         self._lock = threading.Lock()
         self._mode: str | None = None
         self._levels = dict.fromkeys(MODES, 0.0)
+        self._affect: str | None = None          # the posture wanted (set_affect), kept across halts
+        self._shown: str | None = None           # the posture the stream fades or holds now
+        self._affect_level = 0.0
+        self._affect_since: float | None = None  # when the shown posture was asked for (its pattern's t)
         self._thread: threading.Thread | None = None
         self._run_id = 0          # a stream sends only while its run is current: halt() starts a new one
         self._placed = False      # the robot is in the neutral pose, where every stream starts
@@ -178,9 +214,24 @@ class Gestures:
             self._mode = mode
             if mode is None or self._thread is not None:
                 return
-            self._thread = threading.Thread(target=self._run, args=(self._run_id,), name="medcare-gesture",
-                                            daemon=True)
-            self._thread.start()
+            self._start_locked()
+
+    def set_affect(self, affect: str | None) -> None:
+        """Fade into a sustained posture ("concern" or "joy") under the motions, or out of it (None). Remembered
+        across a halt: it fades in again with the next motion once the robot is placed."""
+        if affect is not None and affect not in AFFECTS:
+            raise ValueError(f"unknown affect {affect}")
+        with self._lock:
+            self._affect = affect
+            if not self._placed or self._thread is not None:
+                return
+            if affect is not None or self._affect_level > 0:
+                self._start_locked()
+
+    def _start_locked(self) -> None:
+        self._thread = threading.Thread(target=self._run, args=(self._run_id,), name="medcare-gesture",
+                                        daemon=True)
+        self._thread.start()
 
     def placed(self) -> None:
         """A goto has just put the robot in the neutral pose: motions may start from there."""
@@ -196,6 +247,7 @@ class Gestures:
             self._run_id += 1
             self._mode, self._placed, thread, self._thread = None, False, self._thread, None
             self._levels = dict.fromkeys(MODES, 0.0)
+            self._shown, self._affect_level, self._affect_since = None, 0.0, None   # the posture is wanted still
         if thread is not None and thread is not threading.current_thread():
             thread.join(1.0)
 
@@ -219,6 +271,7 @@ class Gestures:
             if run_id == self._run_id:
                 self._thread, self._mode, self._placed = None, None, False
                 self._levels = dict.fromkeys(MODES, 0.0)
+                self._shown, self._affect_level, self._affect_since = None, 0.0, None
 
     def _run(self, run_id: int) -> None:
         started = last = origin = None
@@ -253,11 +306,24 @@ class Gestures:
                 if self._move_time is not None:   # the move plays at the speed of its fade, squared
                     self._move_time += (now - last) * smooth(levels["think"]) ** 2
                 since_move = self._move_time
-                idle = self._mode is None and not any(levels.values())
+                # The posture: fade out whatever is shown when another (or none) is wanted, then fade the wanted
+                # one in from the neutral pose
+                step = (now - last) / AFFECT_FADE_SECONDS
+                if self._shown is not None and self._shown != self._affect:
+                    self._affect_level = max(0.0, self._affect_level - step)
+                    if self._affect_level == 0.0:
+                        self._shown, self._affect_since = None, None
+                elif self._affect is not None:
+                    if self._shown is None:
+                        self._shown, self._affect_since = self._affect, now
+                    self._affect_level = min(1.0, self._affect_level + step)
+                affect = None if self._shown is None else (self._shown, self._affect_level,
+                                                           now - (self._affect_since or now))
+                idle = self._mode is None and not any(levels.values()) and affect is None
             last = now
             t = now - started
             think = thinking(self._move, since_move, t) if levels["think"] > 0 else None
-            pose = mix(levels, t, {"think": think}, LIMITS if think is None else MOVE_LIMITS)
+            pose = mix(levels, t, {"think": think}, LIMITS if think is None else MOVE_LIMITS, affect)
             easing = origin != Pose() and t < RECENTER_SECONDS
             if easing:
                 pose = Pose(*(a + b for a, b in zip(pose, easing_back(origin, t))))
@@ -271,7 +337,7 @@ class Gestures:
                 with self._lock:
                     if run_id != self._run_id:
                         return
-                    if self._mode is None:   # nothing new was asked for while the neutral pose went out
+                    if self._mode is None and self._affect is None:   # nothing new asked for meanwhile
                         self._thread = None
                         return
             self._sleep(self._period if think is None else self._move_period)

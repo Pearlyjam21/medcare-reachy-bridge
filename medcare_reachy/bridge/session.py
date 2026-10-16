@@ -52,6 +52,7 @@ SEARCH_TIMEOUT = 600.0          # 10 min to find the patient (also: patient gone
 WATCH_TIMEOUT = 180.0           # 3 min without an event -> help clip
 HELP_TIMEOUT = 180.0            # 3 more min -> leave the dose pending
 DONE_GRACE = 8.0                # after "I finished": time for the camera to resolve the dose first
+MED_CLIP_FETCH_SECONDS = 20.0   # the server renders a medicine's spoken prompt in a few seconds; never wait longer
 AWAY_TIMEOUT = 90.0             # patient out of sight this long while watched -> leave the dose pending
 CHECKIN_SILENCE: float | None = None   # check-in: off (0.7.1): a companion stays while the patient is quiet;
                                        # seconds here end the chat that long after Reachy last spoke, unanswered
@@ -67,7 +68,7 @@ CAMERA_FAILED = "camera_failed"       # live companion chat: its camera stopped 
 CAMERA_LOST_SECONDS = 30.0      # live companion: no camera session, or its camera not "ok", this long -> CAMERA_FAILED
 MEDICINE_WAIT_SECONDS = 30.0    # companion: the medicine ending waits for the patient's words at most this long
 MEDICINE_SPEECH_GAP_SECONDS = 2.0   # live companion: ... while the patient speaks or stopped less than this long ago
-LIVE_AUDIO = ("start_live_audio", "push_audio", "clear_live_audio", "stop_live_audio")   # media.py's live calls
+LIVE_AUDIO = ("start_live_audio", "push_audio", "fill_live_audio", "clear_live_audio", "stop_live_audio")   # media.py
 SPEECH_MODEL = "silero_vad.onnx"   # the listener's voice detector (voice.py STT_FILES); live.SpeechStart uses it too
 # Spoken (not prerecorded) lines, already in the voice's Simplified characters (喔 written 哦, as in the clips).
 CHECKIN_GREETING = {"zh-TW": "您好！我来找您聊聊天。", "en": "Hello! I came to have a chat with you."}
@@ -142,7 +143,11 @@ def open_live_chat(app, robot, speaker, models_dir: Path | None):
     except Exception:
         log.exception("live voice is off: the voice detector did not load from %s", models_dir)
         return None
-    return LiveChat(app, robot, speaker, speech_start=speech_start)
+    hardware = None
+    if all(callable(getattr(robot, name, None)) for name in ("goto", "get_frame", "hold_head")):
+        from medcare_reachy.bridge.reachy_hardware import ReachyMiniHardware
+        hardware = ReachyMiniHardware(robot)   # the GPT-Live agent's camera and emote requests (live.py)
+    return LiveChat(app, robot, speaker, speech_start=speech_start, hardware=hardware)
 
 
 class SlotSession:
@@ -371,10 +376,52 @@ class SlotSession:
                 self._go(WIND_DOWN)
             return
         await self._robot("hold_head")
-        await self._speak(self.clips.play_med_prompt, dose.get("med_id"))
+        position = self.index + 1
+        await self._fetch_med_clip(dose, position)
+        await self._speak(self.clips.play_med_prompt, dose.get("med_id"), position)
         if self._may_listen():
             await self._play("say_when_done")
         self._go(WATCHING)
+
+    async def _fetch_med_clip(self, dose: dict, position: int) -> None:
+        """Reachy names the medicine it asks for: the server's spoken prompt for this medicine and its position in
+        the slot (「請現在吃第一種藥，Adapalene。」, services/med_clips.py), fetched once and kept beside the other
+        clips; a kept clip is checked against the server's key, so a renamed medicine gets a new one. Best effort:
+        without a clip (no server voice, a failure, an older server) the generic prompt plays, never a guessed
+        name. At most MED_CLIP_FETCH_SECONDS, so the prompt is never long delayed."""
+        med_id = dose.get("med_id")
+        if med_id is None or not callable(getattr(self.app, "med_clip", None)):
+            return
+        try:
+            key = self.clips.med_clip_key(med_id, position)
+            found = await asyncio.wait_for(self.app.med_clip(med_id, position, self.language, key),
+                                           MED_CLIP_FETCH_SECONDS)
+        except Exception as exc:   # asyncio.TimeoutError included: the prompt goes on without the name
+            log.warning("slot %s: no spoken prompt for medicine %s (%r)", self.task_id, med_id, exc)
+            return
+        if found is None or found == "unchanged":
+            return
+        data, new_key = found
+        try:
+            await self.run_blocking(self.clips.save_med_clip, med_id, position, data, new_key)
+            log.info("slot %s: spoken prompt for medicine %s (position %d) kept", self.task_id, med_id, position)
+        except Exception:
+            log.exception("slot %s: the spoken prompt for medicine %s could not be kept", self.task_id, med_id)
+
+    async def _file_event(self, dose: dict, outcome: str, latest: dict) -> None:
+        """A watched dose ended without a result: family get the camera's clip of it and the AI's reading from the
+        server (POST /tasks/{id}/event, services/dose_event.py). Best effort, never raises."""
+        if not callable(getattr(self.app, "task_event", None)):
+            return
+        evidence = {"said_done": self.done_at is not None, "phrase": self.done_word,
+                    "degraded": bool(latest.get("degraded")), "landmark_fps": latest.get("landmark_fps"),
+                    "seconds_watched": round(self.clock.monotonic() - self.since, 1), **self._mood_evidence()}
+        try:
+            await self.app.task_event(self.task_id, dose["intk_id"], outcome, evidence)
+            log.info("slot %s: dose %s %s: family get the clip", self.task_id, dose["intk_id"], outcome)
+        except Exception as exc:
+            log.warning("slot %s: the %s event of dose %s was not filed (%r)", self.task_id, outcome,
+                        dose["intk_id"], exc)
 
     async def _watching(self):
         dose = self.doses[self.index]
@@ -407,6 +454,7 @@ class SlotSession:
             return   # the patient says they finished: give the camera a moment to resolve the dose first
         if self._walked_away(latest.get("identity_status"), now):
             self.outcomes[dose["intk_id"]] = "left_pending"
+            await self._file_event(dose, "patient_left", latest)
             self._next_dose()
             return
         if self.help_at is None and now - self.since >= WATCH_TIMEOUT:
@@ -414,6 +462,7 @@ class SlotSession:
             await self._play("help")
         elif self.help_at is not None and now - self.help_at >= HELP_TIMEOUT:
             self.outcomes[dose["intk_id"]] = "left_pending"
+            await self._file_event(dose, "not_seen", latest)
             self._next_dose()
 
     async def _needs_confirm(self, dose: dict, candidate: dict, latest: dict):
@@ -586,6 +635,7 @@ class SlotSession:
             self.outcomes["live"] = "unsupported"
             return False
         chat.gestures = self.gestures   # the settings page's check-in gestures switch (LiveChat reads it per block)
+        chat.mood = self.mood           # the multimodal emotion engine, for the server's emotion tool request
         await self._robot("hold_head")
         if self.voice is not None:
             await self.run_blocking(self.voice.suspend)

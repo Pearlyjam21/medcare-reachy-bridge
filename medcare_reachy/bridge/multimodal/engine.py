@@ -65,6 +65,7 @@ class MultimodalEmotion:
         self._failures = {"speech": 0, "text": 0}
         self._off: set = set()
         self.last: dict | None = None       # the last report, for the status page
+        self.last_at: float | None = None   # ... and when it was scored (clock), for report()
 
     @property
     def branches(self) -> dict[str, bool]:
@@ -151,7 +152,41 @@ class MultimodalEmotion:
                 self._samples.append((np.asarray(probs, dtype=np.float64), fused.used))
                 del self._samples[:-MAX_SAMPLES]
             self.last = {**report, "used": dict(fused.used), "top": EMOTIONS[int(np.argmax(probs))]}
+            self.last_at = now
         return report
+
+    def report(self, now: float | None = None) -> dict:
+        """What the GPT-Live agent's get_current_emotion tool gets from the robot (bridge/live.py): the last fused
+        result (its probabilities in the server's labels, the branches it fused and their weights, how old it is),
+        each branch's latest output or status (face from the last scored frame, voice and text from the last heard
+        segment, stale past voice_ttl), which branches exist, and whether a dose is being watched. JSON-safe."""
+        now = self.clock() if now is None else now
+        with self.lock:
+            last, last_at, active = self.last, self.last_at, self.active
+            fresh = now - self._voice_at <= self.voice_ttl
+            speech, text = self._speech, self._text
+
+        def branch(result: BranchResult | None, stale: bool) -> dict:
+            if result is None:
+                return {"status": "off"}
+            status = "stale" if stale and result.present else result.status
+            out = {"status": status}
+            if result.present:
+                out["probabilities"] = to_server(result.probs)
+                out["top"] = EMOTIONS[int(np.argmax(result.probs))]
+                out["confidence"] = round(float(result.probs.max()), 3)
+            return out
+
+        fused = None
+        if last is not None:
+            probabilities = {name: round(float(p), 3) for name, p in last["probabilities"].items()}
+            fused = {"top": last.get("top"), "confidence": round(max(probabilities.values()), 3),
+                     "probabilities": probabilities, "used": {k: round(float(v), 3) for k, v in last["used"].items()},
+                     "age_seconds": None if last_at is None else round(now - last_at, 1)}
+        return {"available": fused is not None, "fused": fused, "branches": self.branches, "active": active,
+                "fer": {"status": "scored" if fused else "no_frame_scored"},
+                "ser": branch(speech if self.speech is not None else None, not fresh),
+                "ter": branch(text if self.text is not None else None, not fresh)}
 
 
 def load_multimodal(models_dir: Path, language: str = "zh-TW", *, download: bool = True,

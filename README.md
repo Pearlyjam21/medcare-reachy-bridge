@@ -190,6 +190,12 @@ the new ones.
 
 ## Status
 
+- **0.15.0**: the settings page's status (`GET :8042/api/status`) says when the MedAiCarePlus server cannot be reached:
+  a `server` block (`url`, `reachable`, `last_ok_seconds_ago`, `unreachable_for_seconds`, `last_error`), and after
+  30 s without an answer `detail` reads `Cannot reach the server at … (…) for N s.` (`robot_reachable` is the robot
+  daemon, not the server). The log has one `[STARTUP]` line per start-up step (settings, models, robot, voice, the
+  first answer from the server) with the reason when one fails. `tools/robot-autostart/` starts the app after a
+  reboot and after a daemon restart: daemon 1.8.3 has no startup-app setting.
 - **0.10.0**: merges the Space's 0.9.0 companion session (GPT-Live check-ins that stay until goodbye) with 0.9.1
   (multimodal emotion while a dose is watched, face following, the microphone start for SDK 1.8.3).
 - **0.9.0** (for testing; not on this space yet): the companion session (above). A check-in stays until a goodbye,

@@ -1,0 +1,10 @@
+[Unit]
+Description=Start the medcare_reachy app 25 s after boot, then check every 2 min that it is running
+
+[Timer]
+OnBootSec=25s
+OnUnitActiveSec=2min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

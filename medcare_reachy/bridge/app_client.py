@@ -171,6 +171,28 @@ class AppClient:
         return await self._request("POST", f"/api/device/tasks/{task_id}/extra-event",
                                    json={"event_id": event_id, "decision": decision, "confidence": confidence})
 
+    async def task_event(self, task_id: str, intk_id: int, outcome: str, evidence: dict | None) -> dict | None:
+        """A watched dose that ended without a result (not_seen, patient_left): the server sends family the
+        camera's clip of it. Best effort: a failure never starts an outage."""
+        return await self._request("POST", f"/api/device/tasks/{task_id}/event", track_outage=False,
+                                   json={"intk_id": intk_id, "outcome": outcome, "evidence": evidence})
+
+    async def med_clip(self, med_id: int, position: int, language: str, etag: str | None = None):
+        """The server's spoken prompt for a medicine (services/med_clips.py): (WAV bytes, key), "unchanged" when
+        `etag` still names the server's clip, or None when the server has none or cannot be reached (the robot then
+        says its generic prompt). Never raises and never starts an outage."""
+        headers = {"If-None-Match": f'"{etag}"'} if etag else {}
+        try:
+            response = await self._http.get(f"/api/device/clips/med/{int(med_id)}", headers=headers,
+                                            params={"position": int(position), "language": language}, timeout=40.0)
+        except httpx.HTTPError:
+            return None
+        if response.status_code == 304:
+            return "unchanged"
+        if response.status_code != 200 or not response.content:
+            return None
+        return response.content, response.headers.get("ETag", "").strip('"')
+
     async def heartbeat(self, payload: dict, camera: dict | None = None) -> dict:
         """`camera`: the camera watchdog's snapshot (state, fps, since, media), sent as "camera" when given. Servers
         before it ignore the key."""

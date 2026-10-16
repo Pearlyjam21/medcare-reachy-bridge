@@ -93,11 +93,31 @@ class ClipPlayer:
         turn is in (voice.DoneListener's think_aloud): its length in seconds, or None without those clips."""
         return self.start(THINKING)
 
-    def play_med_prompt(self, med_id) -> bool:
-        clip_id = f"med_{med_id}"
-        if self.path(clip_id).is_file():
-            return self.play(clip_id)
+    def play_med_prompt(self, med_id, position: int | None = None) -> bool:
+        """The medicine's own prompt, naming it: the server's clip for its position in the slot (med_<id>_<n>.wav,
+        save_med_clip), else a per-medication clip (med_<id>.wav), else the generic prompt."""
+        for clip_id in ([f"med_{med_id}_{int(position)}"] if position else []) + [f"med_{med_id}"]:
+            if self.path(clip_id).is_file():
+                return self.play(clip_id)
         return self.play(GENERIC_MED_PROMPT)
+
+    def med_clip_key(self, med_id, position: int) -> str | None:
+        """The key the server gave the clip kept for this medicine and position (its sidecar), or None."""
+        sidecar = self.path(f"med_{med_id}_{int(position)}").with_suffix(".json")
+        try:
+            return json.loads(sidecar.read_text(encoding="utf-8")).get("key") or None
+        except (OSError, ValueError):
+            return None
+
+    def save_med_clip(self, med_id, position: int, data: bytes, key: str) -> None:
+        """Keep the server's prompt clip for this medicine and position, with its key beside it."""
+        path = self.path(f"med_{med_id}_{int(position)}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".part")
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        path.with_suffix(".json").write_text(json.dumps({"key": key}), encoding="utf-8")
+        self.missing.discard(path.stem)
 
     def audit(self) -> set[str]:
         """Record every manifest clip without a WAV, so the first heartbeat already reports them."""

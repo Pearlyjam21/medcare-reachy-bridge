@@ -2,7 +2,14 @@
 
 from pydantic import BaseModel
 
+from medcare_reachy.service import ServiceBusy
 from medcare_reachy.settings_store import SettingsError, public_view
+
+
+class ExpressRequest(BaseModel):
+    affect: str | None = None     # "concern", "joy" or null (no posture)
+    move: str | None = None       # a recorded emotion move, e.g. "downcast1", or null
+    seconds: float = 6.0          # how long the posture is held before it is lifted (1-20)
 
 
 class ConfigUpdate(BaseModel):
@@ -42,3 +49,15 @@ def register_routes(api, service) -> None:
     def restart():
         service.restart()
         return service.status()
+
+    @api.post("/api/express")
+    def express(request: ExpressRequest):
+        """A test of Reachy's body language on the real robot, from the laptop, without a chat: the posture
+        (`affect`: concern, joy) and one recorded emotion move (`move`, media.MOVE_LIBRARIES "emotion"), as the live
+        chat's `express` message would show them, for `seconds`. Refused (409) while a reminder or a chat runs."""
+        from fastapi.responses import JSONResponse
+
+        try:
+            return service.express(request.affect, request.move, request.seconds)
+        except ServiceBusy as exc:
+            return JSONResponse({"detail": str(exc)}, status_code=409)

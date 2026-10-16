@@ -810,3 +810,25 @@ def test_the_websocket_sends_the_robot_key_and_reports_the_servers_close_code():
     assert sent is True and sent_after is False
     assert received == ['{"type": "ready", "conversation_id": "c9"}', b"\x01\x00\x02\x00", None]
     assert code == 4409
+
+
+def test_a_speaker_loop_that_fell_behind_fills_the_gap_with_silence_instead_of_bursting():
+    """13 Oct 2026: a 105-150 ms stall of the loop left the whole chat silent (media.LIVE_PTS_RESYNC_SECONDS)."""
+    async def scenario():
+        chat = Chat()
+        start = chat.clock.t   # the loop's first tick; the fake clock stands still, so its ticks run ahead of it
+        task = chat.start()
+        await chat.ready()
+        chat.socket.serve(pcm(2.0))
+        await until(lambda: len(chat.robot.pushed) >= 5)
+        blocks = chat.robot.blocks
+        # The clock jumps to 150 ms past the loop's next tick (one tick per block pushed so far)
+        chat.clock.t = start + blocks * BLOCK_SAMPLES / RATE + 0.15
+        await until(lambda: "fill_live_audio" in chat.robot.calls)
+        await until(lambda: chat.robot.blocks >= blocks + 3)   # ... and it goes on at its pace, no burst
+        chat.socket.serve({"type": "end", "reason": "goodbye", "risk": False})
+        await task
+        return chat
+
+    chat = run(scenario)
+    assert chat.robot.calls.count("fill_live_audio") == 1 and chat.live.late_fills == 1

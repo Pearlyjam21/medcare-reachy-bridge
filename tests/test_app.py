@@ -114,9 +114,14 @@ class FakeRunner:
         self.clips = type("C", (), {"missing_count": 11})()
         self.stream = type("S", (), {"landmark_fps": lambda self: 9.84, "vision_fps": lambda self: 4.0,
                                      "camera_fps": lambda self: 10.04})()
+        self.server = {"url": GOOD["app_url"], "reachable": True, "last_ok_seconds_ago": 2.0,
+                       "unreachable_for_seconds": None, "last_error": None}   # what server_status() answers
 
     def request_shutdown(self):
         self.stopping.set()
+
+    def server_status(self):
+        return dict(self.server)
 
 
 def fake_bridge(record):
@@ -315,6 +320,46 @@ def test_status_describes_the_current_step_during_a_task(tmp_path):
     service.stop()
 
 
+def test_status_reports_the_server_and_says_when_it_cannot_be_reached(tmp_path):
+    """When the laptop's address changed, the page kept saying running, "Waiting for a medication reminder", with
+    robot_reachable true (that is the robot daemon), while the log only showed a timeout every 10 s (14 Oct 2026)."""
+    store = SettingsStore(tmp_path / "s.json")
+    store.save(GOOD)
+    runners = []
+
+    async def bridge(reachy_mini, settings, models_dir, on_runner):
+        runner = FakeRunner()
+        runners.append(runner)
+        on_runner(runner)
+        await runner.stopping.wait()
+
+    service = BridgeService(object(), store, bridge=bridge)
+    no_runner = {"url": None, "reachable": None, "last_ok_seconds_ago": None, "unreachable_for_seconds": None,
+                 "last_error": None}
+    assert service.status()["server"] == no_runner
+    service.start()
+    assert wait_for(lambda: service.status()["state"] == "running")
+    [runner] = runners
+    status = service.status()
+    assert status["server"] == runner.server and status["robot_reachable"] is True
+    assert status["detail"] == "Waiting for a medication reminder from the server."
+    runner.server.update(reachable=False, last_ok_seconds_ago=12.0, unreachable_for_seconds=12.0,
+                         last_error="ConnectTimeout: POST /api/device/heartbeat")
+    assert service.status()["detail"] == "Waiting for a medication reminder from the server."   # one missed answer
+    runner.server.update(last_ok_seconds_ago=45.0, unreachable_for_seconds=45.0)
+    status = service.status()
+    assert status["detail"] == ("Cannot reach the server at http://192.168.1.20:8001 "
+                                "(ConnectTimeout: POST /api/device/heartbeat) for 45 s.")
+    assert status["state"] == "running" and status["server"]["reachable"] is False
+    runner.slot = type("Slot", (), {"state": "SEARCHING", "task": {"task_id": "t-1"}})()
+    assert "Looking for the patient" in service.status()["detail"]   # a reminder in progress names its step
+    runner.slot = None
+    runner.server.update(reachable=True, last_ok_seconds_ago=0.5, unreachable_for_seconds=None)
+    assert service.status()["detail"] == "Waiting for a medication reminder from the server."   # nothing was stored
+    service.stop()
+    assert service.status()["server"] == no_runner
+
+
 # ── the real default bridge ──
 def test_damaged_install_stops_with_a_clear_status_instead_of_crashing(tmp_path):
     store = SettingsStore(tmp_path / "s.json")
@@ -345,4 +390,4 @@ def test_the_package_and_the_heartbeat_report_the_same_version():
     from medcare_reachy.bridge import __version__
 
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__ == "0.10.0"
+    assert tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"] == __version__ == "0.15.0"

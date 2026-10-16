@@ -1,0 +1,9 @@
+[Unit]
+Description=Start the medcare_reachy app through the Reachy Mini daemon when it is not running
+After=network-online.target reachy-mini-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pollen
+ExecStart=/home/pollen/.medcare_reachy/bin/medcare-reachy-app.sh

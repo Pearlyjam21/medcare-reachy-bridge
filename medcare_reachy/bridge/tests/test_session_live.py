@@ -485,6 +485,9 @@ class LiveAudioRobot(PlainRobot):
     def push_audio(self, samples):
         return True
 
+    def fill_live_audio(self):
+        return 0.0
+
     def clear_live_audio(self):
         return True
 

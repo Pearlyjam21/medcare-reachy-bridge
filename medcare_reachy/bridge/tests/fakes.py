@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import time
 from collections import deque
 from datetime import datetime, timedelta, timezone
 
@@ -39,6 +40,16 @@ class FakeRobot:
         self.pushed = []            # the blocks with sound (float32 copies) ...
         self.pushed_at = []         # ... and the value of `blocks` once each was pushed
         self.cleared_at = None      # `blocks` when clear_live_audio() was last called
+        self.frame = None           # what get_frame() answers (a BGR array), None: no new frame
+        self.fill_seconds = 0.15    # what fill_live_audio() answers (the silence it pushed)
+        # The GPT-Live agent's recorded moves (bridge/reachy_hardware.py):
+        self.dances = {"side_to_side_sway": "A smooth, side-to-side sway of the entire head.",
+                       "jackson_square": "Traces a rectangle via a 5-point path."}
+        self.emotions = {"downcast1": "A longer movement that shows discouragement or sadness.",
+                         "cheerful1": "It is like whistling."}
+        self.dance_seconds = 0.0    # how long play_move() takes (polling should_stop every 5 ms)
+        self.danced = []            # the names play_move() got, dances and emotion moves alike
+        self.affects = []           # what express() got
 
     def get_audio(self):
         return self.mic.popleft() if self.mic else None
@@ -56,11 +67,37 @@ class FakeRobot:
             self.pushed_at.append(self.blocks)
         return True
 
+    def fill_live_audio(self):
+        self.calls.append("fill_live_audio")
+        return self.fill_seconds
+
     def clear_live_audio(self):
         self.calls.append("clear_live_audio")
         self.cleared_at = self.blocks
         if self.clear_error is not None:
             raise self.clear_error
+
+    def move_names(self, library):
+        return dict(self.dances if library == "dance" else self.emotions)
+
+    def express(self, affect):
+        self.affects.append(affect)
+        self.calls.append(f"express:{affect}")
+
+    def play_move(self, library, name, should_stop):
+        if name not in self.move_names(library):
+            raise ValueError(f"Move {name} not found")
+        self.danced.append(name)
+        self.calls.append(f"play_move:{library}:{name}")
+        outcome = "completed"
+        deadline = time.monotonic() + self.dance_seconds
+        while time.monotonic() < deadline:
+            if should_stop():
+                outcome = "cancelled"
+                break
+            time.sleep(0.005)
+        self.hold_head()   # as ReachyRobot.play_dance ends: back in the neutral pose
+        return outcome
 
     def stop_live_audio(self):
         self.calls.append("stop_live_audio")
@@ -93,6 +130,12 @@ class FakeRobot:
     def hold_head(self):
         self.calls.append("hold_head")
 
+    def goto(self, pose, antennas_deg=(0.0, 0.0), duration=0.5):
+        self.calls.append(f"goto:{antennas_deg[0]:.0f},{antennas_deg[1]:.0f}")
+
+    def get_frame(self):
+        return self.frame
+
     def look_at(self, u, v, duration=0.35):
         self.calls.append(f"look_at:{u:.2f},{v:.2f}")
 
@@ -106,6 +149,8 @@ class FakeClips:
     def __init__(self):
         self.played = []
         self.missing = set()
+        self.prompt_positions = []   # play_med_prompt's position per call
+        self.saved = {}              # (med_id, position) -> (data, key) kept by save_med_clip
 
     def play(self, clip_id):
         self.played.append(clip_id)
@@ -118,8 +163,16 @@ class FakeClips:
         self.played.append(clip_id)
         return self.ACK_SECONDS
 
-    def play_med_prompt(self, med_id):
+    def play_med_prompt(self, med_id, position=None):
         self.played.append(f"med_prompt:{med_id}")
+        self.prompt_positions.append(position)
+        return True
+
+    def med_clip_key(self, med_id, position):
+        return self.saved.get((med_id, position), (None, None))[1]
+
+    def save_med_clip(self, med_id, position, data, key):
+        self.saved[(med_id, position)] = (data, key)
         return True
 
 
@@ -300,6 +353,7 @@ class FakeApp:
         self.sessions = []
         self.companion_starts = []   # conversation_start's `companion`, per call
         self.monitor_companion = []   # monitor_start's `companion`, per call
+        self.med_clips = {}           # (med_id, position) -> (wav bytes, key) the server's clip route answers
 
     def _maybe_fail(self, name):
         queue = self.fail.get(name)
@@ -327,6 +381,20 @@ class FakeApp:
         self._maybe_fail("confirmation")
         self.dose(intk_id)["intake_stats"] = "pending_confirmation"
         return {"confirmation_id": "c1"}
+
+    async def task_event(self, task_id, intk_id, outcome, evidence):
+        self.calls.append(("task_event", intk_id, outcome, evidence))
+        self._maybe_fail("task_event")
+        return {"event": f"robot:{task_id}:{intk_id}:{outcome}", "queued": True}
+
+    async def med_clip(self, med_id, position, language, etag=None):
+        """What the server's prompt clip route answers: `med_clips[(med_id, position)]` = (bytes, key), or
+        "unchanged" when `etag` matches, None without one."""
+        self.calls.append(("med_clip", med_id, position, language, etag))
+        found = self.med_clips.get((med_id, position))
+        if found is None:
+            return None
+        return "unchanged" if etag and etag == found[1] else found
 
     async def extra_event(self, task_id, event_id, decision, confidence):
         self.calls.append(("extra_event", event_id, decision, confidence))
